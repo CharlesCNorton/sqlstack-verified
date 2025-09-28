@@ -445,7 +445,8 @@ Fixpoint all_keys_in_range (low high : option btree_key) (kvs : list (btree_key 
 Record typed_bag : Type := {
   bag_schema : schema;
   bag_tuples : list typed_tuple;
-  bag_wf : forall t, In t bag_tuples -> t.(tuple_schema) = bag_schema
+  bag_wf : forall t, In t bag_tuples -> t.(tuple_schema) = bag_schema;
+  bag_unique : unique_schema bag_schema
 }.
 
 Inductive agg_func : Type :=
@@ -934,7 +935,8 @@ Qed.
 Definition select (p : typed_tuple -> tri) (b : typed_bag) : typed_bag :=
   {| bag_schema := b.(bag_schema);
      bag_tuples := filter (fun t => tri_to_bool (p t)) b.(bag_tuples);
-     bag_wf := filter_preserves_schema _ _ _ (bag_wf b)
+     bag_wf := filter_preserves_schema _ _ _ (bag_wf b);
+     bag_unique := b.(bag_unique)
   |}.
 
 Definition select_expr (e : typed_expr TBool) (b : typed_bag) : typed_bag :=
@@ -1009,19 +1011,20 @@ Lemma select_false_empty : forall b,
   bag_eq (select (fun _ => FalseT) b)
     {| bag_schema := b.(bag_schema);
        bag_tuples := [];
-       bag_wf := fun t H => match H with end |}.
+       bag_wf := fun t H => match H with end;
+       bag_unique := b.(bag_unique) |}.
 Proof.
-  intros [s ts wf].
+  intros [s ts wf uniq].
   unfold bag_eq, select; simpl.
   split.
   - reflexivity.
   - rewrite filter_false_nil. apply Permutation_refl.
 Qed.
 
-Lemma count_star_empty : forall s,
-  agg_count_star {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end |} = VInt 0.
+Lemma count_star_empty : forall s (Huniq : unique_schema s),
+  agg_count_star {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end; bag_unique := Huniq |} = VInt 0.
 Proof.
-  intros s.
+  intros.
   unfold agg_count_star.
   simpl.
   reflexivity.
@@ -1055,37 +1058,37 @@ Proof.
   reflexivity.
 Qed.
 
-Lemma agg_sum_empty : forall col s,
-  agg_sum col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end |} = VNull TInt.
+Lemma agg_sum_empty : forall col s (Huniq : unique_schema s),
+  agg_sum col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end; bag_unique := Huniq |} = VNull TInt.
 Proof.
-  intros col s.
+  intros.
   unfold agg_sum.
   simpl.
   reflexivity.
 Qed.
 
-Lemma agg_min_empty : forall col s,
-  agg_min col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end |} = VNull TInt.
+Lemma agg_min_empty : forall col s (Huniq : unique_schema s),
+  agg_min col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end; bag_unique := Huniq |} = VNull TInt.
 Proof.
-  intros col s.
+  intros.
   unfold agg_min.
   simpl.
   reflexivity.
 Qed.
 
-Lemma agg_max_empty : forall col s,
-  agg_max col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end |} = VNull TInt.
+Lemma agg_max_empty : forall col s (Huniq : unique_schema s),
+  agg_max col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end; bag_unique := Huniq |} = VNull TInt.
 Proof.
-  intros col s.
+  intros.
   unfold agg_max.
   simpl.
   reflexivity.
 Qed.
 
-Lemma agg_avg_empty : forall col s,
-  agg_avg col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end |} = VNull TInt.
+Lemma agg_avg_empty : forall col s (Huniq : unique_schema s),
+  agg_avg col {| bag_schema := s; bag_tuples := []; bag_wf := fun t H => match H with end; bag_unique := Huniq |} = VNull TInt.
 Proof.
-  intros col s.
+  intros.
   unfold agg_avg.
   simpl.
   reflexivity.
@@ -1476,11 +1479,92 @@ Proof.
   intros. subst. assumption.
 Qed.
 
+Lemma concat_tuple_wf_nd (t1 t2 : typed_tuple) :
+  List.length (t1.(tuple_data) ++ t2.(tuple_data)) =
+  List.length (t1.(tuple_schema) ++ t2.(tuple_schema)) /\
+  (forall i v,
+     nth_error (t1.(tuple_data) ++ t2.(tuple_data)) i = Some (Some v) ->
+     exists c t,
+       nth_error (t1.(tuple_schema) ++ t2.(tuple_schema)) i = Some (c, t) /\
+       value_type v = t).
+Proof.
+  split.
+  - rewrite !app_length.
+    destruct (tuple_wf t1) as [H1 _].
+    destruct (tuple_wf t2) as [H2 _].
+    now rewrite H1, H2.
+  - intros i v H0.
+    destruct (tuple_wf t1) as [Hlen1 Hty1].
+    destruct (tuple_wf t2) as [Hlen2 Hty2].
+    destruct (lt_dec i (List.length (tuple_data t1))).
+    + rewrite nth_error_app1 in H0 by lia.
+      rewrite nth_error_app1 by (rewrite <- Hlen1; lia).
+      eapply Hty1; eauto.
+    + rewrite nth_error_app2 in H0 by lia.
+      rewrite nth_error_app2 by (rewrite <- Hlen1; lia).
+      specialize (Hty2 (i - List.length (tuple_data t1)) v H0).
+      destruct Hty2 as [c [t [H3 H4]]].
+      exists c, t. split; auto.
+      rewrite <- H3. f_equal. lia.
+Qed.
+
+Definition concat_tuples_nd (t1 t2 : typed_tuple) : typed_tuple :=
+  {|
+    tuple_schema := t1.(tuple_schema) ++ t2.(tuple_schema);
+    tuple_data   := t1.(tuple_data)   ++ t2.(tuple_data);
+    tuple_wf     := concat_tuple_wf_nd t1 t2
+  |}.
+
+Lemma product_real_wf : forall b1 b2 (Hdisj : schema_disjoint b1.(bag_schema) b2.(bag_schema)) t,
+  In t (flat_map (fun t1 => map (fun t2 => concat_tuples_nd t1 t2) b2.(bag_tuples)) b1.(bag_tuples)) ->
+  t.(tuple_schema) = schema_union b1.(bag_schema) b2.(bag_schema).
+Proof.
+  intros b1 b2 Hdisj t Hin.
+  apply in_flat_map' in Hin.
+  destruct Hin as [t1 [Hin1 Hin2]].
+  apply in_map_iff in Hin2.
+  destruct Hin2 as [t2 [Heq Hin2']].
+  subst t.
+  simpl.
+  unfold schema_union.
+  rewrite (bag_wf b1 t1 Hin1).
+  rewrite (bag_wf b2 t2 Hin2').
+  reflexivity.
+Qed.
+
+Lemma disjoint_union_unique : forall s1 s2,
+  schema_disjoint s1 s2 ->
+  unique_schema s1 ->
+  unique_schema s2 ->
+  unique_schema (s1 ++ s2).
+Proof.
+  unfold unique_schema, schema_disjoint.
+  intros s1 s2 Hdisj Huniq1 Huniq2 i j c t1 t2 Hneq Hi Hj.
+  destruct (lt_dec i (List.length s1)).
+  - rewrite nth_error_app1 in Hi by assumption.
+    destruct (lt_dec j (List.length s1)).
+    + rewrite nth_error_app1 in Hj by assumption.
+      apply (Huniq1 i j c t1 t2); assumption.
+    + rewrite nth_error_app2 in Hj by lia.
+      apply nth_error_In in Hi.
+      apply nth_error_In in Hj.
+      apply (Hdisj c t1 t2); assumption.
+  - rewrite nth_error_app2 in Hi by lia.
+    destruct (lt_dec j (List.length s1)).
+    + rewrite nth_error_app1 in Hj by assumption.
+      apply nth_error_In in Hi.
+      apply nth_error_In in Hj.
+      apply (Hdisj c t2 t1); assumption.
+    + rewrite nth_error_app2 in Hj by lia.
+      apply (Huniq2 (i - List.length s1) (j - List.length s1) c t1 t2); lia || assumption.
+Qed.
+
 Definition product (b1 b2 : typed_bag)
   (Hdisj : schema_disjoint b1.(bag_schema) b2.(bag_schema)) : typed_bag :=
   {| bag_schema := schema_union b1.(bag_schema) b2.(bag_schema);
-     bag_tuples := [];
-     bag_wf := fun t H => match H with end
+     bag_tuples := flat_map (fun t1 => map (fun t2 => concat_tuples_nd t1 t2) b2.(bag_tuples)) b1.(bag_tuples);
+     bag_wf := product_real_wf b1 b2 Hdisj;
+     bag_unique := disjoint_union_unique b1.(bag_schema) b2.(bag_schema) Hdisj b1.(bag_unique) b2.(bag_unique)
   |}.
 
 Definition join_on (e : typed_expr TBool) (b1 b2 : typed_bag)
@@ -1524,42 +1608,6 @@ Proof.
   rewrite H by (left; reflexivity).
   rewrite IH; auto; intros x Hx; apply H; right; exact Hx.
 Qed.
-
-Lemma concat_tuple_wf_nd (t1 t2 : typed_tuple) :
-  List.length (t1.(tuple_data) ++ t2.(tuple_data)) =
-  List.length (t1.(tuple_schema) ++ t2.(tuple_schema)) /\
-  (forall i v,
-     nth_error (t1.(tuple_data) ++ t2.(tuple_data)) i = Some (Some v) ->
-     exists c t,
-       nth_error (t1.(tuple_schema) ++ t2.(tuple_schema)) i = Some (c, t) /\
-       value_type v = t).
-Proof.
-  split.
-  - rewrite !app_length.
-    destruct (tuple_wf t1) as [H1 _].
-    destruct (tuple_wf t2) as [H2 _].
-    now rewrite H1, H2.
-  - intros i v H0.
-    destruct (tuple_wf t1) as [Hlen1 Hty1].
-    destruct (tuple_wf t2) as [Hlen2 Hty2].
-    destruct (lt_dec i (List.length (tuple_data t1))).
-    + rewrite nth_error_app1 in H0 by lia.
-      rewrite nth_error_app1 by (rewrite <- Hlen1; lia).
-      eapply Hty1; eauto.
-    + rewrite nth_error_app2 in H0 by lia.
-      rewrite nth_error_app2 by (rewrite <- Hlen1; lia).
-      specialize (Hty2 (i - List.length (tuple_data t1)) v H0).
-      destruct Hty2 as [c [t [H3 H4]]].
-      exists c, t. split; auto.
-      rewrite <- H3. f_equal. lia.
-Qed.
-
-Definition concat_tuples_nd (t1 t2 : typed_tuple) : typed_tuple :=
-  {|
-    tuple_schema := t1.(tuple_schema) ++ t2.(tuple_schema);
-    tuple_data   := t1.(tuple_data)   ++ t2.(tuple_data);
-    tuple_wf     := concat_tuple_wf_nd t1 t2
-  |}.
 
 Definition mentions_only_any {t} (Γ : schema) (e : typed_expr t) : Prop :=
   forall c, mentions_col e c = true -> exists ty, In (c,ty) Γ.
@@ -1625,20 +1673,94 @@ Proof.
   - exact Hm.
 Qed.
 
-Lemma product_real_wf : forall b1 b2 (Hdisj : schema_disjoint b1.(bag_schema) b2.(bag_schema)) t,
-  In t (flat_map (fun t1 => map (fun t2 => concat_tuples_nd t1 t2) b2.(bag_tuples)) b1.(bag_tuples)) ->
-  t.(tuple_schema) = schema_union b1.(bag_schema) b2.(bag_schema).
+Lemma get_typed_value_concat_right_nd :
+  forall t1 t2 c,
+    (exists ty, In (c, ty) t2.(tuple_schema)) ->
+    schema_disjoint t1.(tuple_schema) t2.(tuple_schema) ->
+    unique_schema t1.(tuple_schema) ->
+    unique_schema t2.(tuple_schema) ->
+    get_typed_value (concat_tuples_nd t1 t2) c = get_typed_value t2 c.
 Proof.
-  intros b1 b2 Hdisj t Hin.
-  apply in_flat_map' in Hin.
-  destruct Hin as [t1 [Hin1 Hin2]].
-  apply in_map_iff in Hin2.
-  destruct Hin2 as [t2 [Heq Hin2']].
-  subst t.
-  simpl.
-  unfold schema_union.
-  rewrite (bag_wf b1 t1 Hin1).
-  rewrite (bag_wf b2 t2 Hin2').
+  intros t1 t2 c [ty Hin] Hdisj Huniq1 Huniq2.
+  unfold get_typed_value, concat_tuples_nd; simpl.
+  destruct (find_column_index t2.(tuple_schema) c) as [i|] eqn:Hi.
+  - destruct (find_column_index (t1.(tuple_schema) ++ t2.(tuple_schema)) c) as [j|] eqn:Hj.
+    + assert (j = List.length t1.(tuple_schema) + i).
+      { pose proof (find_column_index_app_right t1.(tuple_schema) t2.(tuple_schema) c i) as H.
+        assert (unique_schema (t1.(tuple_schema) ++ t2.(tuple_schema))).
+        { apply disjoint_union_unique; assumption. }
+        assert (forall ty', ~In (c, ty') t1.(tuple_schema)).
+        { intros ty' Hin'.
+          unfold schema_disjoint in Hdisj.
+          apply (Hdisj c ty' ty); assumption. }
+        specialize (H H0 Hi H1).
+        rewrite H in Hj. injection Hj. auto. }
+      subst j.
+      destruct (tuple_wf t1) as [Hlen1 _].
+      destruct (tuple_wf t2) as [Hlen2 _].
+      rewrite <- Hlen1.
+      rewrite nth_error_app2 by lia.
+      replace (List.length (tuple_data t1) + i - List.length (tuple_data t1)) with i by lia.
+      reflexivity.
+    + exfalso.
+      assert (exists n, find_column_index (t1.(tuple_schema) ++ t2.(tuple_schema)) c = Some n).
+      { destruct (find_column_index_some_of_in (t1.(tuple_schema) ++ t2.(tuple_schema)) c ty) as [n Hn].
+        apply in_or_app. right. exact Hin.
+        exists n. exact Hn. }
+      destruct H as [n Hn]. congruence.
+  - exfalso.
+    destruct (find_column_index_some_of_in t2.(tuple_schema) c ty Hin) as [i' Hi'].
+    congruence.
+Qed.
+
+Lemma eval_expr_concat_right_nd :
+  forall t (e : typed_expr t) t1 t2,
+    mentions_only_any t2.(tuple_schema) e ->
+    schema_disjoint t1.(tuple_schema) t2.(tuple_schema) ->
+    unique_schema t1.(tuple_schema) ->
+    unique_schema t2.(tuple_schema) ->
+    eval_expr e (concat_tuples_nd t1 t2) = eval_expr e t2.
+Proof.
+  induction e; intros t1 t2 Hm Hdisj Huniq1 Huniq2; simpl; try reflexivity.
+  - unfold mentions_only_any in Hm.
+    assert (mentions_col (TECol t q) q = true) by apply qualified_column_eqb_refl.
+    destruct (Hm q H) as [ty Hin].
+    apply get_typed_value_concat_right_nd; try assumption.
+    exists ty. exact Hin.
+  - rewrite IHe1 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; left; exact Hc).
+    rewrite IHe2 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; right; exact Hc).
+    reflexivity.
+  - rewrite IHe1 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; left; exact Hc).
+    rewrite IHe2 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; right; exact Hc).
+    reflexivity.
+  - assert (H1: eval_expr e1 (concat_tuples_nd t1 t2) = eval_expr e1 t2).
+    { apply IHe1; try assumption. intros c Hc. apply Hm. simpl. apply orb_true_iff. left. exact Hc. }
+    assert (H2: eval_expr e2 (concat_tuples_nd t1 t2) = eval_expr e2 t2).
+    { apply IHe2; try assumption. intros c Hc. apply Hm. simpl. apply orb_true_iff. right. exact Hc. }
+    rewrite H1, H2. reflexivity.
+  - assert (H1: eval_expr e1 (concat_tuples_nd t1 t2) = eval_expr e1 t2).
+    { apply IHe1; try assumption. intros c Hc. apply Hm. simpl. apply orb_true_iff. left. exact Hc. }
+    assert (H2: eval_expr e2 (concat_tuples_nd t1 t2) = eval_expr e2 t2).
+    { apply IHe2; try assumption. intros c Hc. apply Hm. simpl. apply orb_true_iff. right. exact Hc. }
+    rewrite H1, H2. reflexivity.
+  - rewrite IHe by (try assumption; exact Hm). reflexivity.
+  - rewrite IHe by (try assumption; exact Hm). reflexivity.
+  - rewrite IHe1 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; left; exact Hc).
+    rewrite IHe2 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; right; exact Hc).
+    reflexivity.
+Qed.
+
+Lemma eval_pred_concat_right_nd :
+  forall e t1 t2,
+    mentions_only t2.(tuple_schema) e ->
+    schema_disjoint t1.(tuple_schema) t2.(tuple_schema) ->
+    unique_schema t1.(tuple_schema) ->
+    unique_schema t2.(tuple_schema) ->
+    eval_pred e (concat_tuples_nd t1 t2) = eval_pred e t2.
+Proof.
+  intros e t1 t2 Hm Hdisj Huniq1 Huniq2.
+  unfold eval_pred.
+  rewrite eval_expr_concat_right_nd; try assumption.
   reflexivity.
 Qed.
 
@@ -1651,7 +1773,8 @@ Definition product_real (b1 b2 : typed_bag)
   {|
     bag_schema := schema_union b1.(bag_schema) b2.(bag_schema);
     bag_tuples := tuples;
-    bag_wf := product_real_wf b1 b2 Hdisj
+    bag_wf := product_real_wf b1 b2 Hdisj;
+    bag_unique := disjoint_union_unique b1.(bag_schema) b2.(bag_schema) Hdisj b1.(bag_unique) b2.(bag_unique)
   |}.
 
 Lemma select_pushdown_product_real :
@@ -1685,6 +1808,79 @@ Proof.
   apply Permutation_refl.
 Qed.
 
+Lemma select_pushdown_product_right :
+  forall e b1 b2 (Hdisj : schema_disjoint b1.(bag_schema) b2.(bag_schema)),
+  mentions_only b2.(bag_schema) e ->
+  bag_eq (select_expr e (product b1 b2 Hdisj))
+         (product b1 (select_expr e b2) Hdisj).
+Proof.
+  intros e [s1 ts1 wf1 uniq1] [s2 ts2 wf2 uniq2] Hdisj Honly.
+  unfold bag_eq, select_expr, product, select; simpl.
+  split; [reflexivity|].
+  set (p := fun t => tri_to_bool (eval_pred e t)).
+  rewrite filter_flat_map.
+  assert (flat_map (fun t1 => filter p (map (fun t2 => concat_tuples_nd t1 t2) ts2)) ts1 =
+          flat_map (fun t1 => map (fun t2 => concat_tuples_nd t1 t2) (filter p ts2)) ts1).
+  { apply flat_map_ext_In; intros t1 Hin1.
+    assert (H: forall t2, In t2 ts2 -> p (concat_tuples_nd t1 t2) = p t2).
+    { intros t2 Hin2.
+      unfold p.
+      assert (Hm2 : mentions_only (tuple_schema t2) e).
+      { intros c Hc. destruct (Honly c Hc) as [ty Hin]. exists ty.
+        rewrite (wf2 t2 Hin2). exact Hin. }
+      assert (Hdisj': schema_disjoint (tuple_schema t1) (tuple_schema t2)).
+      { intros c ty1 ty2 HinT1 HinT2.
+        rewrite (wf1 t1 Hin1) in HinT1.
+        rewrite (wf2 t2 Hin2) in HinT2.
+        apply (Hdisj c ty1 ty2 HinT1 HinT2). }
+      assert (Huniq1': unique_schema (tuple_schema t1)).
+      { rewrite (wf1 t1 Hin1). exact uniq1. }
+      assert (Huniq2': unique_schema (tuple_schema t2)).
+      { rewrite (wf2 t2 Hin2). exact uniq2. }
+      rewrite (eval_pred_concat_right_nd e t1 t2 Hm2 Hdisj' Huniq1' Huniq2'). reflexivity. }
+    clear Honly wf1 wf2 Hdisj uniq1 uniq2.
+    induction ts2 as [|t2 ts2' IH]; simpl; [reflexivity|].
+    rewrite H by (left; reflexivity).
+    destruct (p t2); simpl.
+    - f_equal. apply IH. intros. apply H. right. assumption.
+    - apply IH. intros. apply H. right. assumption. }
+  rewrite H.
+  apply Permutation_refl.
+Qed.
+
+Fixpoint project_schema (cols : list qualified_column) (s : schema) : schema :=
+  match cols with
+  | [] => []
+  | c :: cols' =>
+      match find (fun ct => qualified_column_eqb (fst ct) c) s with
+      | Some ct => ct :: project_schema cols' s
+      | None => project_schema cols' s
+      end
+  end.
+
+Lemma project_schema_subset : forall cols s c ty,
+  In (c, ty) (project_schema cols s) ->
+  In c cols /\ In (c, ty) s.
+Proof.
+  induction cols; intros s c ty H; simpl in H.
+  - contradiction.
+  - simpl in H.
+    destruct (find (fun ct => qualified_column_eqb (fst ct) a) s) as [[c' ty']|] eqn:Hfind.
+    + simpl in H.
+      destruct H as [H | H].
+      * injection H; intros; subst.
+        apply find_some in Hfind.
+        destruct Hfind as [Hin Heqb].
+        simpl in Heqb.
+        destruct (qualified_column_eqb_spec c a).
+        -- subst. split; [left; reflexivity | exact Hin].
+        -- discriminate.
+      * destruct (IHcols s c ty H) as [H1 H2].
+        split; [right; exact H1 | exact H2].
+    + destruct (IHcols s c ty H) as [H1 H2].
+      split; [right; exact H1 | exact H2].
+Qed.
+
 Lemma select_pushdown_product_left :
   forall e b1 b2 (Hdisj : schema_disjoint b1.(bag_schema) b2.(bag_schema)),
   mentions_only b1.(bag_schema) e ->
@@ -1693,7 +1889,25 @@ Lemma select_pushdown_product_left :
 Proof.
   intros e [s1 ts1 wf1] [s2 ts2 wf2] Hdisj Honly.
   unfold bag_eq, select_expr, product, select; simpl.
-  split.
-  - reflexivity.
-  - apply Permutation_refl.
+  split; [reflexivity|].
+  set (p := fun t => tri_to_bool (eval_pred e t)).
+  rewrite filter_flat_map.
+  assert (flat_map (fun t1 => filter p (map (fun t2 => concat_tuples_nd t1 t2) ts2)) ts1 =
+          flat_map (fun t1 => if p t1 then map (fun t2 => concat_tuples_nd t1 t2) ts2 else []) ts1).
+  { apply flat_map_ext_In; intros t1 Hin1.
+    assert (Hconst : forall x, In x (map (fun t2 => concat_tuples_nd t1 t2) ts2) -> p x = p t1).
+    { intros x Hx.
+      apply in_map_iff in Hx.
+      destruct Hx as [t2 [Heq Hin2]].
+      subst x.
+      unfold p.
+      assert (Hm1 : mentions_only (tuple_schema t1) e).
+      { intros c Hc. destruct (Honly c Hc) as [ty Hin]. exists ty.
+        rewrite (wf1 t1 Hin1). exact Hin. }
+      rewrite (eval_pred_concat_left_nd e t1 t2 Hm1). reflexivity. }
+    rewrite (filter_const_on_list _ _ _ _ Hconst).
+    reflexivity. }
+  rewrite H.
+  rewrite flat_map_filter_switch.
+  apply Permutation_refl.
 Qed.
