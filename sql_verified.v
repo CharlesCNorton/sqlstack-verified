@@ -2150,6 +2150,146 @@ Definition project_tuple (cols : list qualified_column) (tu : typed_tuple)
      tuple_wf := project_tuple_full_wf cols tu Huniq
   |}.
 
+Lemma project_tuple_schema : forall cols tu Huniq,
+  (project_tuple cols tu Huniq).(tuple_schema) = project_schema cols tu.(tuple_schema).
+Proof.
+  intros.
+  simpl.
+  reflexivity.
+Qed.
+
+Lemma bag_tuples_unique_schema : forall b t,
+  In t b.(bag_tuples) ->
+  unique_schema b.(bag_schema) ->
+  unique_schema t.(tuple_schema).
+Proof.
+  intros b t Hin Huniq.
+  pose proof (bag_wf b t Hin) as Heq.
+  rewrite Heq.
+  exact Huniq.
+Qed.
+
+Program Definition project_tuple_with_schema_eq (cols : list qualified_column) (t : typed_tuple)
+  (s : schema) (Heq : t.(tuple_schema) = s) (Huniq : unique_schema s) : typed_tuple :=
+  project_tuple cols t _.
+
+Lemma in_map_lemma : forall {A B} (f : A -> B) l x,
+  In x l -> In (f x) (map f l).
+Proof.
+  intros.
+  apply in_map.
+  exact H.
+Qed.
+
+Definition project_cols_helper (cols : list qualified_column) (t : typed_tuple) (s : schema)
+  (Heq : t.(tuple_schema) = s) (Huniq : unique_schema s) : typed_tuple.
+Proof.
+  subst s.
+  exact (project_tuple cols t Huniq).
+Defined.
+
+Lemma tuple_unique_from_bag : forall b t,
+  In t b.(bag_tuples) ->
+  unique_schema t.(tuple_schema).
+Proof.
+  intros b t Hin.
+  pose proof (bag_wf b t Hin) as Hschema.
+  rewrite Hschema.
+  apply bag_unique.
+Qed.
+
+Lemma project_preserves_schema : forall cols b t (Hin : In t b.(bag_tuples)),
+  (project_tuple cols t (tuple_unique_from_bag b t Hin)).(tuple_schema) = project_schema cols b.(bag_schema).
+Proof.
+  intros cols b t Hin.
+  simpl.
+  pose proof (bag_wf b t Hin) as Hschema.
+  rewrite <- Hschema.
+  reflexivity.
+Qed.
+
+Definition sql_value_eq_dec (v1 v2 : sql_value) : {v1 = v2} + {v1 <> v2}.
+Proof.
+  decide equality; try apply Z.eq_dec; try apply String.string_dec; try apply Bool.bool_dec; try apply sql_type_eq_dec.
+Defined.
+
+Lemma typed_tuple_eq_dec : forall (t1 t2 : typed_tuple), {t1 = t2} + {t1 <> t2}.
+Proof.
+  intros t1 t2.
+  destruct t1 as [s1 d1 wf1].
+  destruct t2 as [s2 d2 wf2].
+  destruct (list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) s1 s2).
+  - destruct (list_eq_dec (option_eq_dec sql_value_eq_dec) d1 d2).
+    + subst. left. f_equal. apply proof_irrelevance.
+    + right. intro H. injection H. intros. contradiction.
+  - right. intro H. injection H. intros. contradiction.
+Defined.
+
+Lemma filter_map_In {A B : Type} (f : A -> option B) (l : list A) (y : B) :
+  In y (filter_map f l) ->
+  exists x, In x l /\ f x = Some y.
+Proof.
+  induction l; simpl; intros H.
+  - contradiction.
+  - destruct (f a) eqn:Hfa.
+    + simpl in H. destruct H as [H|H].
+      * subst. exists a. split; auto.
+      * destruct (IHl H) as [x [Hin Hfx]].
+        exists x. split; auto.
+    + destruct (IHl H) as [x [Hin Hfx]].
+      exists x. split; auto.
+Qed.
+
+Lemma project_tuple_schema_eq : forall cols t Huniq,
+  (project_tuple cols t Huniq).(tuple_schema) = project_schema cols t.(tuple_schema).
+Proof.
+  intros. simpl. reflexivity.
+Qed.
+
+Definition project_bag_tuple cols b t (Hin : In t b.(bag_tuples)) : typed_tuple :=
+  project_tuple cols t (tuple_unique_from_bag b t Hin).
+
+Lemma project_bag_preserves : forall cols b t Hin,
+  (project_bag_tuple cols b t Hin).(tuple_schema) = project_schema cols b.(bag_schema).
+Proof.
+  intros. unfold project_bag_tuple. simpl.
+  pose proof (bag_wf b t Hin) as Heq.
+  rewrite <- Heq. reflexivity.
+Qed.
+
+Definition project_bag_tuple' (cols : list qualified_column) (b : typed_bag) : typed_tuple -> typed_tuple.
+Proof.
+  intro t.
+  destruct (List.in_dec typed_tuple_eq_dec t b.(bag_tuples)) as [Hin|].
+  - assert (Huniq: unique_schema t.(tuple_schema)).
+    { pose proof (bag_wf b t Hin) as Heq. rewrite Heq. exact (bag_unique b). }
+    exact (project_tuple cols t Huniq).
+  - exact t.
+Defined.
+
+Lemma project_bag_wf : forall cols b t,
+  In t (map (project_bag_tuple' cols b) b.(bag_tuples)) ->
+  t.(tuple_schema) = project_schema cols b.(bag_schema).
+Proof.
+  intros cols b t Hin.
+  apply in_map_iff in Hin.
+  destruct Hin as [t' [Heq Hin']].
+  subst t.
+  unfold project_bag_tuple'.
+  destruct (in_dec typed_tuple_eq_dec t' (bag_tuples b)) as [Hin0|].
+  - simpl. pose proof (bag_wf b t' Hin0) as Hschema. rewrite <- Hschema. reflexivity.
+  - contradiction.
+Qed.
+
+Definition project_cols (cols : list qualified_column) (b : typed_bag)
+  (Hproj_uniq : unique_schema (project_schema cols b.(bag_schema))) : typed_bag :=
+  {| bag_schema := project_schema cols b.(bag_schema);
+     bag_tuples := map (project_bag_tuple' cols b) b.(bag_tuples);
+     bag_wf := project_bag_wf cols b;
+     bag_unique := Hproj_uniq
+  |}.
+
+
 Lemma col_lookup_exists : forall Γ tu c ty,
   unique_schema Γ ->
   Γ = tu.(tuple_schema) ->
