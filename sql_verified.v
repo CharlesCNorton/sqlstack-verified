@@ -216,6 +216,40 @@ Proof.
   decide equality.
 Defined.
 
+Definition option_eq_dec {A : Type} (A_eq_dec : forall x y : A, {x = y} + {x <> y})
+                                    (o1 o2 : option A) : {o1 = o2} + {o1 <> o2}.
+Proof.
+  destruct o1, o2.
+  - destruct (A_eq_dec a a0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - right. discriminate.
+  - right. discriminate.
+  - left. reflexivity.
+Defined.
+
+Definition qualified_column_eq_dec (c1 c2 : qualified_column) : {c1 = c2} + {c1 <> c2}.
+Proof.
+  destruct c1 as [t1 n1], c2 as [t2 n2].
+  destruct (option_eq_dec String.string_dec t1 t2).
+  - destruct (String.string_dec n1 n2).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - right. intro H. injection H. intros. contradiction.
+Defined.
+
+Definition prod_eq_dec {A B : Type} (A_eq_dec : forall x y : A, {x = y} + {x <> y})
+                                     (B_eq_dec : forall x y : B, {x = y} + {x <> y})
+                                     (p1 p2 : A * B) : {p1 = p2} + {p1 <> p2}.
+Proof.
+  destruct p1 as [a1 b1], p2 as [a2 b2].
+  destruct (A_eq_dec a1 a2).
+  - destruct (B_eq_dec b1 b2).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - right. intro H. injection H. intros. contradiction.
+Defined.
+
 Definition sql_value_is_distinct_from (v1 v2 : sql_value) : bool :=
   match v1, v2 with
   | VNull t1, VNull t2 =>
@@ -1910,4 +1944,369 @@ Proof.
   rewrite H.
   rewrite flat_map_filter_switch.
   apply Permutation_refl.
+Qed.
+
+Fixpoint project_tuple_data (cols : list qualified_column) (s : schema) (data : list (option sql_value)) : list (option sql_value) :=
+  match cols with
+  | [] => []
+  | c :: cols' =>
+      match find (fun ct => qualified_column_eqb (fst ct) c) s with
+      | Some _ =>
+          match find_column_index s c with
+          | Some i =>
+              match nth_error data i with
+              | Some v => v :: project_tuple_data cols' s data
+              | None => None :: project_tuple_data cols' s data
+              end
+          | None => None :: project_tuple_data cols' s data
+          end
+      | None => project_tuple_data cols' s data
+      end
+  end.
+
+Lemma project_tuple_data_length : forall cols s data,
+  List.length (project_tuple_data cols s data) = List.length (project_schema cols s).
+Proof.
+  induction cols; intros; simpl.
+  - reflexivity.
+  - destruct (find (fun ct => qualified_column_eqb (fst ct) a) s).
+    + simpl. destruct (find_column_index s a).
+      * destruct (nth_error data n); simpl; f_equal; apply IHcols.
+      * simpl; f_equal; apply IHcols.
+    + apply IHcols.
+Qed.
+
+
+Lemma project_tuple_basic_wf : forall cols s data,
+  List.length (project_tuple_data cols s data) = List.length (project_schema cols s) /\
+  (forall i v,
+    nth_error (project_tuple_data cols s data) i = Some (Some v) ->
+    exists c t, nth_error (project_schema cols s) i = Some (c, t)).
+Proof.
+  intros cols s data.
+  split.
+  - generalize dependent data.
+    generalize dependent s.
+    induction cols; intros; simpl.
+    + reflexivity.
+    + destruct (find (fun ct => qualified_column_eqb (fst ct) a) s).
+      * simpl.
+        destruct (find_column_index s a).
+        -- destruct (nth_error data n); simpl; f_equal; apply IHcols.
+        -- simpl; f_equal; apply IHcols.
+      * apply IHcols.
+  - intros i v H.
+    generalize dependent i.
+    generalize dependent v.
+    generalize dependent data.
+    generalize dependent s.
+    induction cols; intros; simpl in H.
+    + destruct i; discriminate.
+    + destruct (find (fun ct => qualified_column_eqb (fst ct) a) s) as [p|] eqn:Hfind.
+      * destruct (find_column_index s a) as [idx|] eqn:Hidx.
+        -- destruct (nth_error data idx).
+           ++ destruct i; simpl in H.
+              ** injection H; intros; subst.
+                 destruct p as [c t].
+                 exists c, t.
+                 simpl project_schema.
+                 rewrite Hfind.
+                 simpl.
+                 reflexivity.
+              ** destruct (IHcols s data v i H) as [c' [t' Hnth]].
+                 exists c', t'.
+                 simpl project_schema.
+                 rewrite Hfind.
+                 simpl.
+                 exact Hnth.
+           ++ destruct i; simpl in H.
+              ** discriminate.
+              ** destruct (IHcols s data v i H) as [c' [t' Hnth]].
+                 exists c', t'.
+                 simpl project_schema.
+                 rewrite Hfind.
+                 simpl.
+                 exact Hnth.
+        -- destruct i; simpl in H.
+           ++ discriminate.
+           ++ destruct (IHcols s data v i H) as [c' [t' Hnth]].
+              exists c', t'.
+              simpl project_schema.
+              rewrite Hfind.
+              simpl.
+              exact Hnth.
+      * destruct (IHcols s data v i H) as [c' [t' Hnth]].
+        exists c', t'.
+        simpl project_schema.
+        rewrite Hfind.
+        exact Hnth.
+Qed.
+
+Lemma project_tuple_full_wf : forall cols tu,
+  unique_schema tu.(tuple_schema) ->
+  let new_schema := project_schema cols tu.(tuple_schema) in
+  let new_data := project_tuple_data cols tu.(tuple_schema) tu.(tuple_data) in
+  List.length new_data = List.length new_schema /\
+  (forall i v,
+    nth_error new_data i = Some (Some v) ->
+    exists c t, nth_error new_schema i = Some (c, t) /\ value_type v = t).
+Proof.
+  intros cols tu Huniq.
+  simpl.
+  destruct (project_tuple_basic_wf cols tu.(tuple_schema) tu.(tuple_data)) as [Hlen Hex].
+  split.
+  - exact Hlen.
+  - intros i v H.
+    destruct (Hex i v H) as [c [t Hnth]].
+    exists c, t.
+    split.
+    + exact Hnth.
+    + destruct (tuple_wf tu) as [_ Hwf].
+      generalize dependent v.
+      generalize dependent i.
+      generalize dependent c.
+      generalize dependent t.
+      generalize dependent tu.
+      induction cols; intros.
+      * simpl in H. destruct i; discriminate.
+      * simpl in H.
+        destruct (find (fun ct => qualified_column_eqb (fst ct) a) (tuple_schema tu)) as [[c' t']|] eqn:Hfind.
+        -- destruct (find_column_index (tuple_schema tu) a) as [idx|] eqn:Hidx.
+           ++ destruct (nth_error (tuple_data tu) idx) as [opt|] eqn:Hdata.
+              ** destruct i; simpl in H.
+                 --- destruct opt as [v'|].
+                     +++ injection H; intros; subst v'.
+                         simpl in Hnth.
+                         rewrite Hfind in Hnth.
+                         simpl in Hnth.
+                         injection Hnth; intros; subst c' t'.
+                         specialize (Hwf idx v Hdata).
+                         destruct Hwf as [c'' [t'' [Hschema'' Htype]]].
+                         rewrite Htype.
+                         f_equal.
+                         apply find_some in Hfind.
+                         destruct Hfind as [Hin Heqb].
+                         simpl in Heqb.
+                         destruct (qualified_column_eqb_spec c a).
+                         *** subst c.
+                             pose proof (find_column_index_correct (tuple_schema tu) a idx Huniq Hidx) as [ty Hschema_a].
+                             rewrite Hschema_a in Hschema''.
+                             injection Hschema''; intros; subst c'' t''.
+                             assert (ty = t).
+                             { clear -Hin Hschema_a Huniq.
+                               apply nth_error_In in Hschema_a.
+                               assert (exists i, nth_error (tuple_schema tu) i = Some (a, t)).
+                               { apply In_nth_error. exact Hin. }
+                               destruct H as [i Hi].
+                               assert (exists j, nth_error (tuple_schema tu) j = Some (a, ty)).
+                               { apply In_nth_error. exact Hschema_a. }
+                               destruct H as [j Hj].
+                               destruct (Nat.eq_dec i j).
+                               -- subst j. rewrite Hi in Hj. injection Hj; intros; subst. reflexivity.
+                               -- exfalso. eapply Huniq; eauto. }
+                             congruence.
+                         *** discriminate.
+                     +++ discriminate.
+                 --- eapply IHcols.
+                     +++ exact Huniq.
+                     +++ apply project_tuple_data_length.
+                     +++ intros i0 v0 H0.
+                         destruct (Hex (S i0) v0) as [c0 [t0 Hschema0]].
+                         *** simpl. rewrite Hfind. rewrite Hidx. rewrite Hdata. exact H0.
+                         *** exists c0, t0.
+                             simpl in Hschema0.
+                             rewrite Hfind in Hschema0.
+                             exact Hschema0.
+                     +++ exact Hwf.
+                     +++ simpl in Hnth.
+                         rewrite Hfind in Hnth.
+                         simpl in Hnth.
+                         exact Hnth.
+                     +++ exact H.
+              ** destruct i; simpl in H.
+                 --- exfalso. clear -H. congruence.
+                 --- destruct (project_tuple_basic_wf cols (tuple_schema tu) (tuple_data tu)) as [Hlen' Hex'].
+                     apply (IHcols tu Huniq Hlen' Hex' Hwf t c i).
+                     +++ simpl in Hnth. rewrite Hfind in Hnth. simpl in Hnth. exact Hnth.
+                     +++ exact H.
+           ++ destruct i; simpl in H.
+              ** exfalso. clear -H. congruence.
+              ** destruct (project_tuple_basic_wf cols (tuple_schema tu) (tuple_data tu)) as [Hlen' Hex'].
+                 apply (IHcols tu Huniq Hlen' Hex' Hwf t c i).
+                 --- simpl in Hnth. rewrite Hfind in Hnth. simpl in Hnth. exact Hnth.
+                 --- exact H.
+        -- destruct (project_tuple_basic_wf cols (tuple_schema tu) (tuple_data tu)) as [Hlen' Hex'].
+           apply (IHcols tu Huniq Hlen' Hex' Hwf t c i).
+           ++ simpl in Hnth. rewrite Hfind in Hnth. exact Hnth.
+           ++ exact H.
+Qed.
+
+Definition project_tuple (cols : list qualified_column) (tu : typed_tuple)
+  (Huniq : unique_schema tu.(tuple_schema)) : typed_tuple :=
+  let new_schema := project_schema cols tu.(tuple_schema) in
+  let new_data := project_tuple_data cols tu.(tuple_schema) tu.(tuple_data) in
+  {| tuple_schema := new_schema;
+     tuple_data := new_data;
+     tuple_wf := project_tuple_full_wf cols tu Huniq
+  |}.
+
+Lemma col_lookup_exists : forall Γ tu c ty,
+  unique_schema Γ ->
+  Γ = tu.(tuple_schema) ->
+  In (c, ty) Γ ->
+  exists opt_v, nth_error tu.(tuple_data) (match find_column_index Γ c with Some i => i | None => 0 end) = Some opt_v.
+Proof.
+  intros Γ tu c ty Huniq Heq Hin.
+  destruct (find_column_index_some_of_in Γ c ty Hin) as [i Hi].
+  rewrite Hi.
+  destruct (tuple_wf tu) as [Hlen Hty].
+  pose proof (find_column_index_bounds Γ c i Hi) as Hbound.
+  subst Γ.
+  assert (i < List.length (tuple_data tu)).
+  { rewrite Hlen. exact Hbound. }
+  destruct (nth_error (tuple_data tu) i) as [opt_v|] eqn:Hnth.
+  - exists opt_v. reflexivity.
+  - exfalso. apply nth_error_Some in H. congruence.
+Qed.
+
+Lemma eval_expr_total : forall t (e : typed_expr t) Γ tu,
+  has_type Γ t e ->
+  unique_schema Γ ->
+  Γ = tu.(tuple_schema) ->
+  mentions_only_any Γ e ->
+  tuple_total tu ->
+  exists v, @eval_expr t e tu = Some v.
+Proof.
+  intros t e.
+  induction e; intros Γ tu Htype Huniq Hschema Hment Htotal; simpl.
+  - unfold get_typed_value.
+    pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    destruct (find_column_index_some_of_in (tuple_schema tu) q t H2) as [i Hi].
+    rewrite Hi.
+    pose proof (find_column_index_correct (tuple_schema tu) q i Huniq Hi) as [ty Hnth_schema].
+    destruct (Htotal i q ty Hnth_schema) as [v [Hnth_data Hty]].
+    rewrite Hnth_data.
+    exists v. reflexivity.
+  - exists (VInt z). reflexivity.
+  - exists (VString s). reflexivity.
+  - exists (VBool b). reflexivity.
+  - exists (VNull t). reflexivity.
+  - assert (Heq := Hschema).
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    apply inj_pair2 in H0. subst e4.
+    apply inj_pair2 in H2. subst e5.
+    destruct (IHe1 (tuple_schema tu) tu H3 Huniq eq_refl Hm1 Htotal) as [v1 Hv1].
+    destruct (IHe2 (tuple_schema tu) tu H4 Huniq eq_refl Hm2 Htotal) as [v2 Hv2].
+    rewrite Hv1, Hv2.
+    exists (match sql_eq_tri v1 v2 with
+            | TrueT => VBool true
+            | FalseT => VBool false
+            | UnknownT => VNull TBool
+            end).
+    reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    destruct (IHe1 (tuple_schema tu) tu H2 Huniq eq_refl Hm1 Htotal) as [v1 Hv1].
+    destruct (IHe2 (tuple_schema tu) tu H3 Huniq eq_refl Hm2 Htotal) as [v2 Hv2].
+    rewrite Hv1, Hv2.
+    exists (match sql_lt_tri v1 v2 with
+            | TrueT => VBool true
+            | FalseT => VBool false
+            | UnknownT => VNull TBool
+            end).
+    reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    exists (match tri_and (match @eval_expr TBool e1 tu with
+                          | Some (VBool b) => if b then TrueT else FalseT
+                          | Some (VNull TBool) => UnknownT
+                          | _ => UnknownT
+                          end)
+                         (match @eval_expr TBool e2 tu with
+                          | Some (VBool b) => if b then TrueT else FalseT
+                          | Some (VNull TBool) => UnknownT
+                          | _ => UnknownT
+                          end) with
+           | TrueT => VBool true
+           | FalseT => VBool false
+           | UnknownT => VNull TBool
+           end).
+    reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    exists (match tri_or (match @eval_expr TBool e1 tu with
+                         | Some (VBool b) => if b then TrueT else FalseT
+                         | Some (VNull TBool) => UnknownT
+                         | _ => UnknownT
+                         end)
+                        (match @eval_expr TBool e2 tu with
+                         | Some (VBool b) => if b then TrueT else FalseT
+                         | Some (VNull TBool) => UnknownT
+                         | _ => UnknownT
+                         end) with
+           | TrueT => VBool true
+           | FalseT => VBool false
+           | UnknownT => VNull TBool
+           end).
+    reflexivity.
+  - inversion Htype; subst.
+    exists (match tri_not (match @eval_expr TBool e tu with
+                          | Some (VBool b) => if b then TrueT else FalseT
+                          | Some (VNull TBool) => UnknownT
+                          | _ => UnknownT
+                          end) with
+           | TrueT => VBool true
+           | FalseT => VBool false
+           | UnknownT => VNull TBool
+           end).
+    reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm: mentions_only_any (tuple_schema tu) e).
+    { intros c Hc. apply Hment. simpl. exact Hc. }
+    apply inj_pair2 in H1. subst e1.
+    destruct (IHe (tuple_schema tu) tu H2 Huniq eq_refl Hm Htotal) as [v Hv].
+    rewrite Hv.
+    destruct v.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
+    + exists (VBool true). reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    apply inj_pair2 in H0. subst e4.
+    apply inj_pair2 in H2. subst e5.
+    destruct (IHe1 (tuple_schema tu) tu H3 Huniq eq_refl Hm1 Htotal) as [v1 Hv1].
+    destruct (IHe2 (tuple_schema tu) tu H4 Huniq eq_refl Hm2 Htotal) as [v2 Hv2].
+    rewrite Hv1, Hv2.
+    exists (VBool (sql_value_is_distinct_from v1 v2)).
+    reflexivity.
 Qed.
