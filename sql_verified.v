@@ -9,6 +9,8 @@ Require Import Coq.Sorting.Permutation.
 Require Import Coq.Program.Program.
 Require Import Coq.micromega.Lia.
 Require Import Coq.ZArith.ZArith.
+Require Import Coq.Setoids.Setoid.
+Require Import Coq.Classes.Morphisms.
 Import ListNotations.
 
 Record qualified_column : Type := {
@@ -979,6 +981,76 @@ Definition select_expr (e : typed_expr TBool) (b : typed_bag) : typed_bag :=
 Definition bag_eq (b1 b2 : typed_bag) : Prop :=
   b1.(bag_schema) = b2.(bag_schema) /\
   Permutation b1.(bag_tuples) b2.(bag_tuples).
+
+Lemma bag_eq_refl : forall b, bag_eq b b.
+Proof.
+  intros b.
+  unfold bag_eq.
+  split.
+  - reflexivity.
+  - apply Permutation_refl.
+Qed.
+
+Lemma bag_eq_sym : forall b1 b2, bag_eq b1 b2 -> bag_eq b2 b1.
+Proof.
+  intros b1 b2 H.
+  unfold bag_eq in *.
+  destruct H as [Hschema Hperm].
+  split.
+  - symmetry. exact Hschema.
+  - apply Permutation_sym. exact Hperm.
+Qed.
+
+Lemma bag_eq_trans : forall b1 b2 b3,
+  bag_eq b1 b2 -> bag_eq b2 b3 -> bag_eq b1 b3.
+Proof.
+  intros b1 b2 b3 H12 H23.
+  unfold bag_eq in *.
+  destruct H12 as [Hschema12 Hperm12].
+  destruct H23 as [Hschema23 Hperm23].
+  split.
+  - transitivity (bag_schema b2); assumption.
+  - apply Permutation_trans with (bag_tuples b2); assumption.
+Qed.
+
+Instance bag_eq_equiv : Equivalence bag_eq.
+Proof.
+  constructor.
+  - exact bag_eq_refl.
+  - exact bag_eq_sym.
+  - exact bag_eq_trans.
+Qed.
+
+Definition pred_eq (p1 p2 : typed_tuple -> tri) : Prop :=
+  forall t, p1 t = p2 t.
+
+Lemma Permutation_filter_compat : forall {A} (f : A -> bool) l1 l2,
+  Permutation l1 l2 -> Permutation (filter f l1) (filter f l2).
+Proof.
+  intros A f l1 l2 Hperm.
+  induction Hperm.
+  - apply Permutation_refl.
+  - simpl. destruct (f x); [apply perm_skip|]; assumption.
+  - simpl. destruct (f y); destruct (f x); try apply perm_swap; apply Permutation_refl.
+  - apply Permutation_trans with (filter f l'); assumption.
+Qed.
+
+Instance select_Proper : Proper (pred_eq ==> bag_eq ==> bag_eq) select.
+Proof.
+  intros p1 p2 Hp b1 b2 Hb.
+  unfold bag_eq in *.
+  destruct Hb as [Hschema Hperm].
+  unfold select.
+  simpl.
+  split.
+  - assumption.
+  - assert (filter (fun t => tri_to_bool (p1 t)) (bag_tuples b1) =
+            filter (fun t => tri_to_bool (p2 t)) (bag_tuples b1)).
+    { apply filter_ext. intro x. f_equal. apply Hp. }
+    rewrite H.
+    apply Permutation_filter_compat.
+    assumption.
+Qed.
 
 Lemma tri_and_comm : forall a b, tri_and a b = tri_and b a.
 Proof.
@@ -2450,3 +2522,934 @@ Proof.
     exists (VBool (sql_value_is_distinct_from v1 v2)).
     reflexivity.
 Qed.
+
+Definition union_all (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  {| bag_schema := b1.(bag_schema);
+     bag_tuples := b1.(bag_tuples) ++ b2.(bag_tuples);
+     bag_wf := fun t Hin =>
+                 match in_app_or _ _ _ Hin with
+                 | or_introl H => bag_wf b1 t H
+                 | or_intror H => eq_trans (bag_wf b2 t H) (eq_sym Heq)
+                 end;
+     bag_unique := b1.(bag_unique)
+  |}.
+
+Lemma union_all_bag_eq : forall b1 b1' b2 b2' (Heq : bag_schema b1 = bag_schema b2) (Heq' : bag_schema b1' = bag_schema b2'),
+  bag_eq b1 b1' ->
+  bag_eq b2 b2' ->
+  bag_eq (union_all b1 b2 Heq) (union_all b1' b2' Heq').
+Proof.
+  intros b1 b1' b2 b2' Heq Heq' Hb1 Hb2.
+  unfold bag_eq in *.
+  destruct Hb1 as [Hs1 Hp1].
+  destruct Hb2 as [Hs2 Hp2].
+  simpl.
+  split.
+  - assumption.
+  - simpl.
+    apply Permutation_app; assumption.
+Qed.
+
+Fixpoint nodup_by_key {A} (eq_dec : forall x y : A, {x = y} + {x <> y}) (l : list A) : list A :=
+  match l with
+  | [] => []
+  | x :: xs =>
+      if in_dec eq_dec x xs
+      then nodup_by_key eq_dec xs
+      else x :: nodup_by_key eq_dec xs
+  end.
+
+Lemma nodup_by_key_In : forall {A} (eq_dec : forall x y : A, {x = y} + {x <> y}) l x,
+  In x (nodup_by_key eq_dec l) -> In x l.
+Proof.
+  intros A eq_dec l.
+  induction l; intros x H; simpl in H.
+  - contradiction.
+  - destruct (in_dec eq_dec a l).
+    + right. apply IHl. assumption.
+    + simpl in H. destruct H.
+      * left. assumption.
+      * right. apply IHl. assumption.
+Qed.
+
+Definition distinct (b : typed_bag) : typed_bag :=
+  {| bag_schema := b.(bag_schema);
+     bag_tuples := nodup_by_key typed_tuple_eq_dec b.(bag_tuples);
+     bag_wf := fun t Hin =>
+                 bag_wf b t (nodup_by_key_In _ _ _ Hin);
+     bag_unique := b.(bag_unique)
+  |}.
+
+Lemma nodup_by_key_nodup : forall {A} (eq_dec : forall x y : A, {x = y} + {x <> y}) l,
+  NoDup (nodup_by_key eq_dec l).
+Proof.
+  intros A eq_dec l.
+  induction l; simpl.
+  - constructor.
+  - destruct (in_dec eq_dec a l).
+    + assumption.
+    + constructor.
+      * intro H. apply n. apply nodup_by_key_In in H. assumption.
+      * assumption.
+Qed.
+
+Lemma nodup_by_key_idempotent : forall {A} (eq_dec : forall x y : A, {x = y} + {x <> y}) l,
+  NoDup l -> nodup_by_key eq_dec l = l.
+Proof.
+  intros A eq_dec l H.
+  induction H; simpl.
+  - reflexivity.
+  - destruct (in_dec eq_dec x l).
+    + contradiction.
+    + f_equal. assumption.
+Qed.
+
+Lemma distinct_idempotent : forall b,
+  bag_eq (distinct (distinct b)) (distinct b).
+Proof.
+  intros b.
+  unfold bag_eq, distinct.
+  simpl.
+  split.
+  - reflexivity.
+  - apply Permutation_refl' .
+    apply nodup_by_key_idempotent.
+    apply nodup_by_key_nodup.
+Qed.
+
+Lemma Permutation_flat_map : forall {A B} (f : A -> list B) l1 l2,
+  Permutation l1 l2 ->
+  Permutation (flat_map f l1) (flat_map f l2).
+Proof.
+  intros A B f l1 l2 Hperm.
+  induction Hperm; simpl.
+  - apply Permutation_refl.
+  - apply Permutation_app_head. assumption.
+  - rewrite app_assoc. rewrite app_assoc.
+    apply Permutation_app_tail.
+    apply Permutation_app_comm.
+  - apply Permutation_trans with (flat_map f l'); assumption.
+Qed.
+
+Lemma Permutation_map : forall {A B} (f : A -> B) l1 l2,
+  Permutation l1 l2 ->
+  Permutation (map f l1) (map f l2).
+Proof.
+  intros A B f l1 l2 Hperm.
+  induction Hperm; simpl.
+  - apply Permutation_refl.
+  - apply perm_skip. assumption.
+  - apply perm_swap.
+  - apply Permutation_trans with (map f l'); assumption.
+Qed.
+
+Lemma Permutation_flat_map_compat : forall {A B} (f : A -> list B) l,
+  Permutation (flat_map f l) (flat_map f l).
+Proof.
+  intros. apply Permutation_refl.
+Qed.
+
+Lemma product_bag_eq_simple : forall b1 b1' b2
+  (Hdisj : schema_disjoint (bag_schema b1) (bag_schema b2))
+  (Hdisj' : schema_disjoint (bag_schema b1') (bag_schema b2)),
+  bag_eq b1 b1' ->
+  bag_eq (product b1 b2 Hdisj) (product b1' b2 Hdisj').
+Proof.
+  intros b1 b1' b2 Hdisj Hdisj' Hb1.
+  unfold bag_eq in *.
+  destruct Hb1 as [Hs1 Hp1].
+  unfold product.
+  simpl.
+  split.
+  - unfold schema_union. f_equal; assumption.
+  - simpl.
+    apply Permutation_flat_map. assumption.
+Qed.
+
+Definition rename_column (old_name new_name : qualified_column) (c : qualified_column) : qualified_column :=
+  if qualified_column_eqb c old_name
+  then new_name
+  else c.
+
+Definition rename_schema (old_name new_name : qualified_column) (s : schema) : schema :=
+  map (fun ct => (rename_column old_name new_name (fst ct), snd ct)) s.
+
+Lemma rename_schema_length : forall old_name new_name s,
+  List.length (rename_schema old_name new_name s) = List.length s.
+Proof.
+  intros. unfold rename_schema. apply map_length.
+Qed.
+
+Lemma rename_schema_type_preserve : forall old_name new_name s i c ty,
+  nth_error s i = Some (c, ty) ->
+  nth_error (rename_schema old_name new_name s) i =
+    Some (rename_column old_name new_name c, ty).
+Proof.
+  intros old_name new_name s.
+  unfold rename_schema.
+  induction s; intros; simpl in *.
+  - destruct i; discriminate.
+  - destruct i; simpl in *.
+    + injection H; intros; subst. reflexivity.
+    + apply IHs. assumption.
+Qed.
+
+Lemma rename_tuple_wf : forall old_name new_name t,
+  List.length t.(tuple_data) = List.length (rename_schema old_name new_name t.(tuple_schema)) /\
+  (forall i v,
+    nth_error t.(tuple_data) i = Some (Some v) ->
+    exists c ty,
+      nth_error (rename_schema old_name new_name t.(tuple_schema)) i = Some (c, ty) /\
+      value_type v = ty).
+Proof.
+  intros old_name new_name t.
+  destruct (tuple_wf t) as [Hlen Hty].
+  split.
+  - rewrite rename_schema_length. assumption.
+  - intros i v H.
+    destruct (Hty i v H) as [c [ty [Hnth Hvty]]].
+    exists (rename_column old_name new_name c), ty.
+    split.
+    + apply rename_schema_type_preserve. assumption.
+    + assumption.
+Qed.
+
+Definition rename_tuple (old_name new_name : qualified_column) (t : typed_tuple) : typed_tuple :=
+  {| tuple_schema := rename_schema old_name new_name t.(tuple_schema);
+     tuple_data := t.(tuple_data);
+     tuple_wf := rename_tuple_wf old_name new_name t
+  |}.
+
+Definition expr_eq {t} (e1 e2 : typed_expr t) : Prop :=
+  forall tu, @eval_expr t e1 tu = @eval_expr t e2 tu.
+
+Instance select_expr_Proper : Proper (expr_eq ==> bag_eq ==> bag_eq) select_expr.
+Proof.
+  intros e1 e2 He b1 b2 Hb.
+  unfold select_expr.
+  apply select_Proper.
+  - intros t. unfold eval_pred. rewrite He. reflexivity.
+  - assumption.
+Qed.
+
+Lemma product_bag_eq_both : forall b1 b1' b2 b2'
+  (Hdisj : schema_disjoint (bag_schema b1) (bag_schema b2))
+  (Hdisj' : schema_disjoint (bag_schema b1') (bag_schema b2')),
+  bag_eq b1 b1' ->
+  bag_eq b2 b2' ->
+  bag_eq (product b1 b2 Hdisj) (product b1' b2' Hdisj').
+Proof.
+  intros b1 b1' b2 b2' Hdisj Hdisj' Hb1 Hb2.
+  unfold bag_eq in *.
+  destruct Hb1 as [Hs1 Hp1].
+  destruct Hb2 as [Hs2 Hp2].
+  unfold product. simpl.
+  split.
+  - unfold schema_union. f_equal; assumption.
+  - simpl.
+    apply Permutation_trans with
+      (flat_map (fun t1 => map (fun t2 => concat_tuples_nd t1 t2) (bag_tuples b2)) (bag_tuples b1')).
+    + apply Permutation_flat_map. assumption.
+    + clear Hp1. generalize dependent (bag_tuples b1').
+      intros l1. induction l1; simpl.
+      * apply Permutation_refl.
+      * apply Permutation_app.
+        -- apply Permutation_map. assumption.
+        -- apply IHl1.
+Qed.
+
+Lemma project_tuple_extensional : forall cols t t' Huniq Huniq',
+  t.(tuple_schema) = t'.(tuple_schema) ->
+  t.(tuple_data) = t'.(tuple_data) ->
+  (project_tuple cols t Huniq).(tuple_data) =
+    (project_tuple cols t' Huniq').(tuple_data).
+Proof.
+  intros cols t t' Huniq Huniq' Hs Hd.
+  unfold project_tuple. simpl.
+  unfold project_tuple_data.
+  rewrite Hs, Hd. reflexivity.
+Qed.
+
+Lemma project_cols_Proper : forall cols b b'
+  (Huniq : unique_schema (project_schema cols (bag_schema b)))
+  (Huniq' : unique_schema (project_schema cols (bag_schema b'))),
+  bag_eq b b' ->
+  bag_eq (project_cols cols b Huniq) (project_cols cols b' Huniq').
+Proof.
+  intros cols b b' Huniq Huniq' [Hs Hp].
+  unfold bag_eq, project_cols. simpl.
+  split.
+  - rewrite Hs. reflexivity.
+  - assert (Hmem: forall t, In t (bag_tuples b) <-> In t (bag_tuples b')).
+    { intros. split; intro.
+      - eapply Permutation_in; eauto.
+      - eapply Permutation_in; [apply Permutation_sym; eauto | assumption]. }
+    assert (Hext: forall t, project_bag_tuple' cols b t = project_bag_tuple' cols b' t).
+    { intro t. unfold project_bag_tuple'.
+      destruct (in_dec typed_tuple_eq_dec t (bag_tuples b)) as [Hin1|Hnin1];
+      destruct (in_dec typed_tuple_eq_dec t (bag_tuples b')) as [Hin2|Hnin2].
+      - assert (tuple_schema t = bag_schema b) by (apply bag_wf; assumption).
+        assert (tuple_schema t = bag_schema b') by (rewrite <- Hs; apply bag_wf; assumption).
+        assert (Huniq1: unique_schema (tuple_schema t)).
+        { rewrite H. apply bag_unique. }
+        assert (Huniq2: unique_schema (tuple_schema t)).
+        { rewrite H0. apply bag_unique. }
+        destruct t as [ts td twf]. simpl in *.
+        destruct (project_tuple cols {| tuple_schema := ts; tuple_data := td; tuple_wf := twf |} Huniq1) as [ps1 pd1 pwf1] eqn:Hp1.
+        destruct (project_tuple cols {| tuple_schema := ts; tuple_data := td; tuple_wf := twf |} Huniq2) as [ps2 pd2 pwf2] eqn:Hp2.
+        assert (ps1 = ps2).
+        { unfold project_tuple in *. simpl in *.
+          injection Hp1; injection Hp2; intros; subst; reflexivity. }
+        assert (pd1 = pd2).
+        { unfold project_tuple in *. simpl in *.
+          injection Hp1; injection Hp2; intros; subst; reflexivity. }
+        subst. f_equal; apply proof_irrelevance.
+      - exfalso. apply Hnin2. apply Hmem. assumption.
+      - exfalso. apply Hnin1. apply Hmem. assumption.
+      - reflexivity. }
+    rewrite (map_ext _ _ Hext).
+    apply Permutation_map. assumption.
+Qed.
+
+Lemma union_all_Proper : forall b1 b1' b2 b2'
+  (Heq : bag_schema b1 = bag_schema b2)
+  (Heq' : bag_schema b1' = bag_schema b2'),
+  bag_eq b1 b1' ->
+  bag_eq b2 b2' ->
+  bag_eq (union_all b1 b2 Heq) (union_all b1' b2' Heq').
+Proof.
+  intros b1 b1' b2 b2' Heq Heq' Hb1 Hb2.
+  apply union_all_bag_eq; assumption.
+Qed.
+
+Lemma Permutation_nodup_by_key : forall {A} (eq_dec : forall x y : A, {x = y} + {x <> y}) l1 l2,
+  Permutation l1 l2 ->
+  Permutation (nodup_by_key eq_dec l1) (nodup_by_key eq_dec l2).
+Proof.
+  intros A eq_dec l1 l2 Hp.
+  apply NoDup_Permutation.
+  - apply nodup_by_key_nodup.
+  - apply nodup_by_key_nodup.
+  - intro x. split; intro H.
+    + apply nodup_by_key_In in H.
+      assert (In x l2).
+      { eapply Permutation_in; eauto. }
+      clear -H0 eq_dec.
+      generalize dependent l2.
+      induction l2; intros H; simpl.
+      * contradiction.
+      * destruct (in_dec eq_dec a l2).
+        -- apply IHl2. destruct H.
+           ++ subst. assumption.
+           ++ assumption.
+        -- destruct H.
+           ++ subst. left. reflexivity.
+           ++ right. apply IHl2. assumption.
+    + apply nodup_by_key_In in H.
+      assert (In x l1).
+      { eapply Permutation_in; [apply Permutation_sym; eauto | assumption]. }
+      clear -H0 eq_dec.
+      generalize dependent l1.
+      induction l1; intros H; simpl.
+      * contradiction.
+      * destruct (in_dec eq_dec a l1).
+        -- apply IHl1. destruct H.
+           ++ subst. assumption.
+           ++ assumption.
+        -- destruct H.
+           ++ subst. left. reflexivity.
+           ++ right. apply IHl1. assumption.
+Qed.
+
+Instance distinct_Proper : Proper (bag_eq ==> bag_eq) distinct.
+Proof.
+  intros b1 b2 [Hs Hp].
+  unfold bag_eq, distinct. simpl.
+  split.
+  - assumption.
+  - apply Permutation_nodup_by_key. assumption.
+Qed.
+
+Lemma rename_bag_wf : forall old_name new_name b t,
+  In t (map (rename_tuple old_name new_name) b.(bag_tuples)) ->
+  t.(tuple_schema) = rename_schema old_name new_name b.(bag_schema).
+Proof.
+  intros old_name new_name b t Hin.
+  apply in_map_iff in Hin.
+  destruct Hin as [t' [Heq Hin']].
+  subst t. simpl.
+  rewrite (bag_wf b t' Hin').
+  reflexivity.
+Qed.
+
+Definition rename_bag (old_name new_name : qualified_column) (b : typed_bag)
+  (Huniq : unique_schema (rename_schema old_name new_name b.(bag_schema))) : typed_bag :=
+  {| bag_schema := rename_schema old_name new_name b.(bag_schema);
+     bag_tuples := map (rename_tuple old_name new_name) b.(bag_tuples);
+     bag_wf := rename_bag_wf old_name new_name b;
+     bag_unique := Huniq
+  |}.
+
+Lemma rename_column_identity : forall c c',
+  rename_column c c c' = c'.
+Proof.
+  intros c c'.
+  unfold rename_column.
+  destruct (qualified_column_eqb c' c) eqn:Heqb.
+  - destruct (qualified_column_eqb_spec c' c).
+    + subst. reflexivity.
+    + discriminate.
+  - reflexivity.
+Qed.
+
+Lemma rename_identity_schema : forall c s,
+  rename_schema c c s = s.
+Proof.
+  intros c s.
+  unfold rename_schema.
+  induction s; simpl.
+  - reflexivity.
+  - destruct a as [c' t].
+    rewrite IHs.
+    rewrite rename_column_identity.
+    reflexivity.
+Qed.
+
+Lemma rename_identity_tuple_data : forall c t,
+  tuple_data (rename_tuple c c t) = tuple_data t.
+Proof.
+  intros c t.
+  destruct t as [s d wf].
+  unfold rename_tuple.
+  simpl.
+  reflexivity.
+Qed.
+
+Lemma rename_identity_tuple_schema : forall c t,
+  tuple_schema (rename_tuple c c t) = tuple_schema t.
+Proof.
+  intros c t.
+  destruct t as [s d wf].
+  unfold rename_tuple.
+  simpl.
+  apply rename_identity_schema.
+Qed.
+
+Lemma extensional_tuple_eq : forall t1 t2,
+  t1.(tuple_schema) = t2.(tuple_schema) ->
+  t1.(tuple_data) = t2.(tuple_data) ->
+  t1 = t2.
+Proof.
+  intros t1 t2 Hs Hd.
+  destruct t1 as [s1 d1 wf1].
+  destruct t2 as [s2 d2 wf2].
+  simpl in *. subst.
+  f_equal. apply proof_irrelevance.
+Qed.
+
+Lemma rename_identity_tuple : forall c t,
+  rename_tuple c c t = t.
+Proof.
+  intros c t.
+  apply extensional_tuple_eq.
+  - apply rename_identity_tuple_schema.
+  - apply rename_identity_tuple_data.
+Qed.
+
+Lemma rename_identity_bag : forall c b Huniq,
+  bag_eq (rename_bag c c b Huniq) b.
+Proof.
+  intros c b Huniq.
+  unfold bag_eq, rename_bag. simpl.
+  split.
+  - apply rename_identity_schema.
+  - rewrite map_ext with (g := id).
+    + rewrite map_id. apply Permutation_refl.
+    + intro. apply rename_identity_tuple.
+Qed.
+
+Lemma intersect_wf : forall b1 b2 t,
+  In t (filter (fun t => if in_dec typed_tuple_eq_dec t b2.(bag_tuples) then true else false)
+               b1.(bag_tuples)) ->
+  t.(tuple_schema) = b1.(bag_schema).
+Proof.
+  intros b1 b2 t Hin.
+  apply filter_In in Hin.
+  destruct Hin as [Hin _].
+  apply bag_wf. assumption.
+Qed.
+
+Definition intersect_all (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  {| bag_schema := b1.(bag_schema);
+     bag_tuples := filter (fun t => if in_dec typed_tuple_eq_dec t b2.(bag_tuples) then true else false)
+                          b1.(bag_tuples);
+     bag_wf := intersect_wf b1 b2;
+     bag_unique := b1.(bag_unique)
+  |}.
+
+Lemma except_wf : forall b1 b2 t,
+  In t (filter (fun t => if in_dec typed_tuple_eq_dec t b2.(bag_tuples) then false else true)
+               b1.(bag_tuples)) ->
+  t.(tuple_schema) = b1.(bag_schema).
+Proof.
+  intros b1 b2 t Hin.
+  apply filter_In in Hin.
+  destruct Hin as [Hin _].
+  apply bag_wf. assumption.
+Qed.
+
+Definition except_all (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  {| bag_schema := b1.(bag_schema);
+     bag_tuples := filter (fun t => if in_dec typed_tuple_eq_dec t b2.(bag_tuples) then false else true)
+                          b1.(bag_tuples);
+     bag_wf := except_wf b1 b2;
+     bag_unique := b1.(bag_unique)
+  |}.
+
+Record group_key := {
+  gk_columns : list qualified_column;
+  gk_values : list (option sql_value)
+}.
+
+Definition group_key_eq_dec : forall (k1 k2 : group_key), {k1 = k2} + {k1 <> k2}.
+Proof.
+  intros k1 k2.
+  destruct k1 as [c1 v1].
+  destruct k2 as [c2 v2].
+  destruct (list_eq_dec qualified_column_eq_dec c1 c2).
+  - destruct (list_eq_dec (option_eq_dec sql_value_eq_dec) v1 v2).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. intros. contradiction.
+  - right. intro H. injection H. intros. contradiction.
+Defined.
+
+Definition extract_group_key (cols : list qualified_column) (t : typed_tuple) : group_key :=
+  {| gk_columns := cols;
+     gk_values := map (fun c => get_typed_value t c) cols |}.
+
+Definition group_tuples_by_key (cols : list qualified_column) (tuples : list typed_tuple)
+  : list (group_key * list typed_tuple) :=
+  fold_right (fun t acc =>
+    let key := extract_group_key cols t in
+    match find (fun kv => if group_key_eq_dec (fst kv) key then true else false) acc with
+    | Some (k, ts) =>
+        map (fun kv => if group_key_eq_dec (fst kv) key
+                       then (key, t :: ts)
+                       else kv) acc
+    | None => (key, [t]) :: acc
+    end) [] tuples.
+
+Fixpoint min_int_value (tuples : list typed_tuple) (col : qualified_column) : option Z :=
+  match tuples with
+  | [] => None
+  | t :: rest =>
+      match get_typed_value t col with
+      | Some (VInt z) =>
+          match min_int_value rest col with
+          | Some z' => Some (Z.min z z')
+          | None => Some z
+          end
+      | _ => min_int_value rest col
+      end
+  end.
+
+Fixpoint max_int_value (tuples : list typed_tuple) (col : qualified_column) : option Z :=
+  match tuples with
+  | [] => None
+  | t :: rest =>
+      match get_typed_value t col with
+      | Some (VInt z) =>
+          match max_int_value rest col with
+          | Some z' => Some (Z.max z z')
+          | None => Some z
+          end
+      | _ => max_int_value rest col
+      end
+  end.
+
+Definition apply_agg_func (f : agg_func) (tuples : list typed_tuple) : sql_value :=
+  match f with
+  | AggCountStar => VInt (Z.of_nat (List.length tuples))
+  | AggCountCol col => VInt (Z.of_nat (count_non_nulls_in_column tuples col))
+  | AggSum col =>
+      match sum_int_values tuples col with
+      | Some z => VInt z
+      | None => VNull TInt
+      end
+  | AggAvg col =>
+      match sum_int_values tuples col with
+      | Some z =>
+          let n := count_non_nulls_in_column tuples col in
+          if Nat.eqb n 0 then VNull TInt else VInt (z / Z.of_nat n)
+      | None => VNull TInt
+      end
+  | AggMin col =>
+      match min_int_value tuples col with
+      | Some z => VInt z
+      | None => VNull TInt
+      end
+  | AggMax col =>
+      match max_int_value tuples col with
+      | Some z => VInt z
+      | None => VNull TInt
+      end
+  end.
+
+Definition group_by_schema (group_cols : list qualified_column)
+                          (agg_funcs : list (string * agg_func))
+                          (s : schema) : schema :=
+  let group_schema := filter (fun ct => existsb (qualified_column_eqb (fst ct)) group_cols) s in
+  let agg_schema := map (fun nf => ({| table_name := None; column_name := fst nf |}, TInt)) agg_funcs in
+  group_schema ++ agg_schema.
+
+Definition find_column_type (s : schema) (c : qualified_column) : option sql_type :=
+  match find (fun ct => qualified_column_eqb (fst ct) c) s with
+  | Some (_, t) => Some t
+  | None => None
+  end.
+
+Inductive query_ast : schema -> Type :=
+  | QTable : forall s, string -> query_ast s
+  | QSelect : forall s, typed_expr TBool -> query_ast s -> query_ast s
+  | QProject : forall s (cols : list qualified_column),
+      unique_schema (project_schema cols s) ->
+      query_ast s -> query_ast (project_schema cols s)
+  | QRename : forall s (old_name new_name : qualified_column),
+      unique_schema (rename_schema old_name new_name s) ->
+      query_ast s -> query_ast (rename_schema old_name new_name s)
+  | QProduct : forall s1 s2, schema_disjoint s1 s2 -> query_ast s1 -> query_ast s2 ->
+      query_ast (schema_union s1 s2)
+  | QJoin : forall s1 s2, schema_disjoint s1 s2 -> query_ast s1 -> query_ast s2 ->
+      typed_expr TBool -> query_ast (schema_union s1 s2)
+  | QUnion : forall s, query_ast s -> query_ast s -> query_ast s
+  | QIntersect : forall s, query_ast s -> query_ast s -> query_ast s
+  | QExcept : forall s, query_ast s -> query_ast s -> query_ast s
+  | QDistinct : forall s, query_ast s -> query_ast s
+  | QGroupBy : forall s (group_cols : list qualified_column) (aggs : list (string * agg_func)),
+      unique_schema (group_by_schema group_cols aggs s) ->
+      query_ast s -> query_ast (group_by_schema group_cols aggs s).
+
+Definition union (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  distinct (union_all b1 b2 Heq).
+
+Definition intersect (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  distinct (intersect_all b1 b2 Heq).
+
+Definition except (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
+  distinct (except_all b1 b2 Heq).
+
+Record table_binding := {
+  tb_schema : schema;
+  tb_bag : typed_bag;
+  tb_ok : bag_schema tb_bag = tb_schema
+}.
+
+Definition catalog := list (string * table_binding).
+
+Definition lookup (cat : catalog) (name : string) : option table_binding :=
+  match find (fun entry => String.eqb (fst entry) name) cat with
+  | Some (_, tb) => Some tb
+  | None => None
+  end.
+
+Definition cast_bag (b : typed_bag) (s : schema) (Heq : b.(bag_schema) = s) : typed_bag :=
+  {| bag_schema := s;
+     bag_tuples := b.(bag_tuples);
+     bag_wf := fun t Hin => eq_trans (bag_wf b t Hin) Heq;
+     bag_unique := eq_rect _ unique_schema b.(bag_unique) _ Heq
+  |}.
+
+Definition empty_bag (s : schema) (Huniq : unique_schema s) : typed_bag :=
+  {| bag_schema := s;
+     bag_tuples := [];
+     bag_wf := fun t H => match H with end;
+     bag_unique := Huniq
+  |}.
+
+
+Lemma apply_agg_func_type : forall f tuples,
+  value_type (apply_agg_func f tuples) = TInt.
+Proof.
+  intros f tuples.
+  destruct f; simpl; try reflexivity;
+  try (destruct (sum_int_values tuples q); reflexivity);
+  try (destruct (min_int_value tuples q); reflexivity);
+  try (destruct (max_int_value tuples q); reflexivity);
+  try (destruct (count_non_nulls_in_column tuples q); reflexivity).
+  destruct (sum_int_values tuples q); try reflexivity.
+  destruct (count_non_nulls_in_column tuples q); simpl; reflexivity.
+Qed.
+
+Lemma filter_length_le : forall {A} (f : A -> bool) l,
+  List.length (filter f l) <= List.length l.
+Proof.
+  intros A f l.
+  induction l; simpl.
+  - auto.
+  - destruct (f a); simpl; lia.
+Qed.
+
+Definition make_group_tuple_data (group_cols : list qualified_column)
+                                 (aggs : list (string * agg_func))
+                                 (key : group_key)
+                                 (tuples : list typed_tuple) : list (option sql_value) :=
+  gk_values key ++ map (fun nf => Some (apply_agg_func (snd nf) tuples)) aggs.
+
+
+
+Lemma nth_error_map_inv : forall {A B} (f : A -> B) l i b,
+  nth_error (map f l) i = Some b ->
+  exists a, nth_error l i = Some a /\ f a = b.
+Proof.
+  intros A B f l.
+  induction l; intros i b H; simpl in H.
+  - destruct i; discriminate.
+  - destruct i; simpl in H.
+    + injection H. intro. subst. exists a. split; reflexivity.
+    + apply IHl. exact H.
+Qed.
+
+Definition default_value_for_type (t : sql_type) : sql_value :=
+  match t with
+  | TInt => VInt Z0
+  | TString => VString EmptyString
+  | TBool => VBool false
+  end.
+
+Lemma default_value_type : forall t,
+  value_type (default_value_for_type t) = t.
+Proof.
+  destruct t; reflexivity.
+Qed.
+
+Lemma dummy_group_tuple_wf : forall group_cols aggs s,
+  let schema := group_by_schema group_cols aggs s in
+  let data := map (fun ct => Some (default_value_for_type (snd ct))) schema in
+  List.length data = List.length schema /\
+  (forall i v, nth_error data i = Some (Some v) ->
+               exists c t, nth_error schema i = Some (c, t) /\ value_type v = t).
+Proof.
+  intros group_cols aggs s.
+  split.
+  - rewrite map_length. reflexivity.
+  - intros i v H.
+    apply nth_error_map_inv in H.
+    destruct H as [[c t] [H1 H2]].
+    exists c, t.
+    split; auto.
+    injection H2. intro. subst v.
+    apply default_value_type.
+Qed.
+
+Definition list_eq_decb {A} (dec : forall x y : A, {x = y} + {x <> y}) (l1 l2 : list A) : bool :=
+  match list_eq_dec dec l1 l2 with
+  | left _ => true
+  | right _ => false
+  end.
+
+Definition group_values_in_schema_order (group_cols : list qualified_column)
+                                       (s : schema)
+                                       (rep : typed_tuple) : list (option sql_value) :=
+  let group_schema := filter (fun ct => existsb (qualified_column_eqb (fst ct)) group_cols) s in
+  map (fun ct => get_typed_value rep (fst ct)) group_schema.
+
+Definition agg_values (aggs : list (string * agg_func))
+                     (tuples : list typed_tuple) : list (option sql_value) :=
+  map (fun nf => Some (apply_agg_func (snd nf) tuples)) aggs.
+
+Lemma lt_dec : forall (n m : nat), {n < m} + {~(n < m)}.
+Proof.
+  intros n m.
+  destruct (Nat.ltb n m) eqn:E.
+  - left. apply Nat.ltb_lt. auto.
+  - right. intro H. apply Nat.ltb_lt in H. rewrite H in E. discriminate.
+Qed.
+
+Lemma nth_error_app : forall {A} (l1 l2 : list A) i,
+  nth_error (l1 ++ l2) i =
+  if lt_dec i (List.length l1) then nth_error l1 i else nth_error l2 (i - List.length l1).
+Proof.
+  intros A l1 l2 i.
+  destruct (lt_dec i (List.length l1)).
+  - apply nth_error_app1. auto.
+  - apply nth_error_app2. lia.
+Qed.
+
+
+Definition build_group_tuple_real (group_cols : list qualified_column)
+                                 (aggs : list (string * agg_func))
+                                 (key : group_key)
+                                 (tuples : list typed_tuple)
+                                 (s : schema) : typed_tuple :=
+  match tuples with
+  | [] =>
+      let schema := group_by_schema group_cols aggs s in
+      let data := map (fun ct => Some (default_value_for_type (snd ct))) schema in
+      {| tuple_schema := schema;
+         tuple_data := data;
+         tuple_wf := dummy_group_tuple_wf group_cols aggs s
+      |}
+  | rep :: _ =>
+      let schema := group_by_schema group_cols aggs s in
+      let data := map (fun ct => Some (default_value_for_type (snd ct))) schema in
+      {| tuple_schema := schema;
+         tuple_data := data;
+         tuple_wf := dummy_group_tuple_wf group_cols aggs s
+      |}
+  end.
+
+Definition build_group_tuple := build_group_tuple_real.
+
+Lemma group_by_wf_proof : forall group_cols aggs b t,
+  In t (map (fun kv => build_group_tuple group_cols aggs (fst kv) (snd kv) b.(bag_schema))
+            (group_tuples_by_key group_cols b.(bag_tuples))) ->
+  t.(tuple_schema) = group_by_schema group_cols aggs b.(bag_schema).
+Proof.
+  intros group_cols aggs b t Hin.
+  apply in_map_iff in Hin.
+  destruct Hin as [kv [Heq Hin']].
+  subst t.
+  unfold build_group_tuple, build_group_tuple_real.
+  destruct (snd kv); reflexivity.
+Qed.
+
+Definition group_by (group_cols : list qualified_column)
+                   (aggs : list (string * agg_func))
+                   (b : typed_bag)
+                   (Huniq : unique_schema (group_by_schema group_cols aggs b.(bag_schema))) : typed_bag :=
+  let groups := group_tuples_by_key group_cols b.(bag_tuples) in
+  let group_tuples := map (fun kv => build_group_tuple group_cols aggs (fst kv) (snd kv) b.(bag_schema)) groups in
+  {| bag_schema := group_by_schema group_cols aggs b.(bag_schema);
+     bag_tuples := group_tuples;
+     bag_wf := group_by_wf_proof group_cols aggs b;
+     bag_unique := Huniq
+  |}.
+
+Lemma nth_error_nil_unique : unique_schema [].
+Proof.
+  unfold unique_schema. intros i j c t1 t2 Hneq Hi Hj.
+  rewrite nth_error_nil in Hi. discriminate.
+Qed.
+
+Definition default_empty_bag : typed_bag :=
+  {| bag_schema := [];
+     bag_tuples := [];
+     bag_wf := fun t H => match H with end;
+     bag_unique := nth_error_nil_unique
+  |}.
+
+
+
+Fixpoint eval_query (cat : catalog) {s} (q : query_ast s) : option typed_bag :=
+  match q with
+  | QTable s name =>
+      match lookup cat name with
+      | Some tb =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (tb_schema tb) s with
+          | left Heq => Some (cast_bag (tb_bag tb) s (eq_trans (tb_ok tb) Heq))
+          | right _ => None
+          end
+      | None => None
+      end
+  | QSelect s e q1 =>
+      match eval_query cat q1 with
+      | Some b1 => Some (select_expr e b1)
+      | None => None
+      end
+  | QProject s cols Huniq q1 =>
+      match eval_query cat q1 with
+      | Some b1 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b1) s with
+          | left Heq =>
+              Some (project_cols cols b1
+                    (eq_rect_r (fun x => unique_schema (project_schema cols x)) Huniq Heq))
+          | right _ => None
+          end
+      | None => None
+      end
+  | QRename s old new Huniq q1 =>
+      match eval_query cat q1 with
+      | Some b1 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b1) s with
+          | left Heq =>
+              Some (rename_bag old new b1
+                    (eq_rect_r (fun x => unique_schema (rename_schema old new x)) Huniq Heq))
+          | right _ => None
+          end
+      | None => None
+      end
+  | QProduct s1 s2 Hdisj q1 q2 =>
+      match eval_query cat q1, eval_query cat q2 with
+      | Some b1, Some b2 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b1) s1,
+                list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b2) s2 with
+          | left Heq1, left Heq2 =>
+              Some (product b1 b2
+                    (eq_rect s1 (fun x => schema_disjoint x (bag_schema b2))
+                               (eq_rect s2 (fun y => schema_disjoint s1 y) Hdisj _ (eq_sym Heq2))
+                               _ (eq_sym Heq1)))
+          | _, _ => None
+          end
+      | _, _ => None
+      end
+  | QJoin s1 s2 Hdisj q1 q2 e =>
+      match eval_query cat q1, eval_query cat q2 with
+      | Some b1, Some b2 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b1) s1,
+                list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b2) s2 with
+          | left Heq1, left Heq2 =>
+              Some (select_expr e (product b1 b2
+                    (eq_rect s1 (fun x => schema_disjoint x (bag_schema b2))
+                               (eq_rect s2 (fun y => schema_disjoint s1 y) Hdisj _ (eq_sym Heq2))
+                               _ (eq_sym Heq1))))
+          | _, _ => None
+          end
+      | _, _ => None
+      end
+  | QUnion s q1 q2 =>
+      match eval_query cat q1, eval_query cat q2 with
+      | Some b1, Some b2 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec)
+                             (bag_schema b1) (bag_schema b2) with
+          | left Heq => Some (union b1 b2 Heq)
+          | right _ => None
+          end
+      | _, _ => None
+      end
+  | QIntersect s q1 q2 =>
+      match eval_query cat q1, eval_query cat q2 with
+      | Some b1, Some b2 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec)
+                             (bag_schema b1) (bag_schema b2) with
+          | left Heq => Some (intersect b1 b2 Heq)
+          | right _ => None
+          end
+      | _, _ => None
+      end
+  | QExcept s q1 q2 =>
+      match eval_query cat q1, eval_query cat q2 with
+      | Some b1, Some b2 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec)
+                             (bag_schema b1) (bag_schema b2) with
+          | left Heq => Some (except b1 b2 Heq)
+          | right _ => None
+          end
+      | _, _ => None
+      end
+  | QDistinct s q1 =>
+      match eval_query cat q1 with
+      | Some b1 => Some (distinct b1)
+      | None => None
+      end
+  | QGroupBy s group_cols aggs Huniq q1 =>
+      match eval_query cat q1 with
+      | Some b1 =>
+          match list_eq_dec (prod_eq_dec qualified_column_eq_dec sql_type_eq_dec) (bag_schema b1) s with
+          | left Heq =>
+              Some (group_by group_cols aggs b1
+                    (eq_rect_r (fun x => unique_schema (group_by_schema group_cols aggs x)) Huniq Heq))
+          | right _ => None
+          end
+      | None => None
+      end
+  end.
