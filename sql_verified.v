@@ -238,7 +238,8 @@ Inductive typed_expr : sql_type -> Type :=
   | TEIsDistinctFrom : forall t, typed_expr t -> typed_expr t -> typed_expr TBool
   | TELike : typed_expr TString -> typed_expr TString -> typed_expr TBool
   | TEConcat : typed_expr TString -> typed_expr TString -> typed_expr TString
-  | TESubstring : typed_expr TString -> typed_expr TInt -> typed_expr TInt -> typed_expr TString.
+  | TESubstring : typed_expr TString -> typed_expr TInt -> typed_expr TInt -> typed_expr TString
+  | TEAdd : typed_expr TInt -> typed_expr TInt -> typed_expr TInt.
 
 Definition sql_type_eq_dec (t1 t2 : sql_type) : {t1 = t2} + {t1 <> t2}.
 Proof.
@@ -390,6 +391,38 @@ Definition sql_substring (v : sql_value) (start : Z) (len : Z) : sql_value :=
   | _ => VNull TString
   end.
 
+Definition sql_add (v1 v2 : sql_value) : sql_value :=
+  match v1, v2 with
+  | VInt n1, VInt n2 => VInt (n1 + n2)
+  | VNull TInt, _ => VNull TInt
+  | _, VNull TInt => VNull TInt
+  | _, _ => VNull TInt
+  end.
+
+Definition sql_sub (v1 v2 : sql_value) : sql_value :=
+  match v1, v2 with
+  | VInt n1, VInt n2 => VInt (n1 - n2)
+  | VNull TInt, _ => VNull TInt
+  | _, VNull TInt => VNull TInt
+  | _, _ => VNull TInt
+  end.
+
+Definition sql_mul (v1 v2 : sql_value) : sql_value :=
+  match v1, v2 with
+  | VInt n1, VInt n2 => VInt (n1 * n2)
+  | VNull TInt, _ => VNull TInt
+  | _, VNull TInt => VNull TInt
+  | _, _ => VNull TInt
+  end.
+
+Definition sql_div (v1 v2 : sql_value) : sql_value :=
+  match v1, v2 with
+  | VInt n1, VInt n2 => if Z.eqb n2 0 then VNull TInt else VInt (n1 / n2)
+  | VNull TInt, _ => VNull TInt
+  | _, VNull TInt => VNull TInt
+  | _, _ => VNull TInt
+  end.
+
 Fixpoint eval_expr {t : sql_type} (e : typed_expr t) (tu : typed_tuple) {struct e} : option sql_value :=
   match e with
   | TECol _ c => get_typed_value tu c
@@ -492,6 +525,11 @@ Fixpoint eval_expr {t : sql_type} (e : typed_expr t) (tu : typed_tuple) {struct 
       | Some v1, _, _ => Some (sql_substring v1 1 0)
       | _, _, _ => None
       end
+  | TEAdd e1 e2 =>
+      match @eval_expr _ e1 tu, @eval_expr _ e2 tu with
+      | Some v1, Some v2 => Some (sql_add v1 v2)
+      | _, _ => None
+      end
   end.
 
 Definition eval_pred (e : typed_expr TBool) (tu : typed_tuple) : tri :=
@@ -516,7 +554,8 @@ Inductive has_type : schema -> forall t, typed_expr t -> Prop :=
   | HT_IsDistinctFrom : forall Γ t e1 e2, has_type Γ t e1 -> has_type Γ t e2 -> has_type Γ TBool (@TEIsDistinctFrom t e1 e2)
   | HT_Like : forall Γ e1 e2, has_type Γ TString e1 -> has_type Γ TString e2 -> has_type Γ TBool (TELike e1 e2)
   | HT_Concat : forall Γ e1 e2, has_type Γ TString e1 -> has_type Γ TString e2 -> has_type Γ TString (TEConcat e1 e2)
-  | HT_Substring : forall Γ e1 e2 e3, has_type Γ TString e1 -> has_type Γ TInt e2 -> has_type Γ TInt e3 -> has_type Γ TString (TESubstring e1 e2 e3).
+  | HT_Substring : forall Γ e1 e2 e3, has_type Γ TString e1 -> has_type Γ TInt e2 -> has_type Γ TInt e3 -> has_type Γ TString (TESubstring e1 e2 e3)
+  | HT_Add : forall Γ e1 e2, has_type Γ TInt e1 -> has_type Γ TInt e2 -> has_type Γ TInt (TEAdd e1 e2).
 
 Definition btree_key := nat.
 
@@ -1405,6 +1444,7 @@ Fixpoint mentions_col {t} (e : typed_expr t) (c : qualified_column) : bool :=
   | TELike e1 e2 => orb (mentions_col e1 c) (mentions_col e2 c)
   | TEConcat e1 e2 => orb (mentions_col e1 c) (mentions_col e2 c)
   | TESubstring e1 e2 e3 => orb (orb (mentions_col e1 c) (mentions_col e2 c)) (mentions_col e3 c)
+  | TEAdd e1 e2 => orb (mentions_col e1 c) (mentions_col e2 c)
   end.
 
 Definition mentions_only (Γ : schema) (e : typed_expr TBool) : Prop :=
@@ -1635,6 +1675,11 @@ Proof.
     + intros c H. apply Honly.
       change (mentions_col (TESubstring e1 e2 e3) c = true).
       simpl mentions_col. rewrite H. reflexivity.
+  - rewrite IHe1.
+    + rewrite IHe2.
+      * reflexivity.
+      * intros c Hc. apply Honly. simpl. apply orb_true_intro. right. exact Hc.
+    + intros c Hc. apply Honly. simpl. apply orb_true_intro. left. exact Hc.
 Qed.
 
 Lemma eval_pred_concat_left : forall e t1 t2 Hdisj,
@@ -1936,6 +1981,9 @@ Proof.
       simpl mentions_col. rewrite Hc.
       destruct (mentions_col e1 c); destruct (mentions_col e2 c); reflexivity. }
     rewrite H1, H2, H3. reflexivity.
+  - rewrite IHe1, IHe2; try reflexivity.
+    + intros c H; apply Hm; simpl; apply orb_true_iff; right; exact H.
+    + intros c H; apply Hm; simpl; apply orb_true_iff; left; exact H.
 Qed.
 
 Lemma eval_pred_concat_left_nd :
@@ -2045,6 +2093,9 @@ Proof.
       simpl mentions_col. rewrite Hc.
       destruct (mentions_col e1 c); destruct (mentions_col e2 c); reflexivity. }
     rewrite H1, H2, H3. reflexivity.
+  - rewrite IHe1 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; left; exact Hc).
+    rewrite IHe2 by (try assumption; intros c Hc; apply Hm; simpl; apply orb_true_iff; right; exact Hc).
+    reflexivity.
 Qed.
 
 Lemma eval_pred_concat_right_nd :
@@ -2832,6 +2883,17 @@ Proof.
     destruct (IHe3 (tuple_schema tu) tu Htype3 Huniq eq_refl Hm3 Htotal) as [v3 Hv3].
     rewrite Hv1, Hv2, Hv3.
     destruct v2; destruct v3; eexists; reflexivity.
+  - pose proof Hschema as Heq.
+    inversion Htype; subst.
+    clear Htype.
+    assert (Hm1: mentions_only_any (tuple_schema tu) e1).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. left. exact Hc. }
+    assert (Hm2: mentions_only_any (tuple_schema tu) e2).
+    { intros c Hc. apply Hment. simpl. apply orb_true_intro. right. exact Hc. }
+    destruct (IHe1 (tuple_schema tu) tu H2 Huniq eq_refl Hm1 Htotal) as [v1 Hv1].
+    destruct (IHe2 (tuple_schema tu) tu H3 Huniq eq_refl Hm2 Htotal) as [v2 Hv2].
+    rewrite Hv1, Hv2.
+    exists (sql_add v1 v2). reflexivity.
 Qed.
 
 Definition union_all (b1 b2 : typed_bag) (Heq : b1.(bag_schema) = b2.(bag_schema)) : typed_bag :=
