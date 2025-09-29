@@ -63,12 +63,30 @@ Qed.
 Inductive sql_type : Type :=
   | TInt : sql_type
   | TString : sql_type
-  | TBool : sql_type.
+  | TBool : sql_type
+  | TDate : sql_type
+  | TTime : sql_type
+  | TDecimal : nat -> nat -> sql_type
+  | TArray : sql_type -> sql_type
+  | TJson : sql_type.
+
+Inductive json_value : Type :=
+  | JNull : json_value
+  | JBool : bool -> json_value
+  | JNumber : Z -> json_value
+  | JString : string -> json_value
+  | JArray : list json_value -> json_value
+  | JObject : list (string * json_value) -> json_value.
 
 Inductive sql_value : Type :=
   | VInt : Z -> sql_value
   | VString : string -> sql_value
   | VBool : bool -> sql_value
+  | VDate : Z -> sql_value
+  | VTime : Z -> sql_value
+  | VDecimal : nat -> nat -> Z -> sql_value
+  | VArray : sql_type -> list sql_value -> sql_value
+  | VJson : json_value -> sql_value
   | VNull : sql_type -> sql_value.
 
 Definition value_type (v : sql_value) : sql_type :=
@@ -76,6 +94,11 @@ Definition value_type (v : sql_value) : sql_type :=
   | VInt _ => TInt
   | VString _ => TString
   | VBool _ => TBool
+  | VDate _ => TDate
+  | VTime _ => TTime
+  | VDecimal p s _ => TDecimal p s
+  | VArray t _ => TArray t
+  | VJson _ => TJson
   | VNull t => t
   end.
 
@@ -215,7 +238,7 @@ Inductive typed_expr : sql_type -> Type :=
 
 Definition sql_type_eq_dec (t1 t2 : sql_type) : {t1 = t2} + {t1 <> t2}.
 Proof.
-  decide equality.
+  decide equality; apply Nat.eq_dec.
 Defined.
 
 Definition option_eq_dec {A : Type} (A_eq_dec : forall x y : A, {x = y} + {x <> y})
@@ -2280,9 +2303,63 @@ Proof.
   reflexivity.
 Qed.
 
-Definition sql_value_eq_dec (v1 v2 : sql_value) : {v1 = v2} + {v1 <> v2}.
+Fixpoint json_value_eq_dec (j1 j2 : json_value) : {j1 = j2} + {j1 <> j2}.
 Proof.
-  decide equality; try apply Z.eq_dec; try apply String.string_dec; try apply Bool.bool_dec; try apply sql_type_eq_dec.
+  destruct j1, j2; try (right; discriminate).
+  - left. reflexivity.
+  - destruct (Bool.bool_dec b b0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (Z.eq_dec z z0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (String.string_dec s s0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (list_eq_dec json_value_eq_dec l l0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (list_eq_dec (prod_eq_dec String.string_dec json_value_eq_dec) l l0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+Defined.
+
+Fixpoint sql_value_eq_dec (v1 v2 : sql_value) : {v1 = v2} + {v1 <> v2}.
+Proof.
+  destruct v1, v2; try (right; discriminate).
+  - destruct (Z.eq_dec z z0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (String.string_dec s s0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (Bool.bool_dec b b0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (Z.eq_dec z z0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (Z.eq_dec z z0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (Nat.eq_dec n n1).
+    + subst. destruct (Nat.eq_dec n0 n2).
+      * subst. destruct (Z.eq_dec z z0).
+        -- subst. left. reflexivity.
+        -- right. intro H. injection H. intros. contradiction.
+      * right. intro H. injection H. intros. contradiction.
+    + right. intro H. injection H. intros. contradiction.
+  - destruct (sql_type_eq_dec s s0).
+    + subst. destruct (list_eq_dec sql_value_eq_dec l l0).
+      * subst. left. reflexivity.
+      * right. intro H. injection H. intros. contradiction.
+    + right. intro H. injection H. intros. contradiction.
+  - destruct (json_value_eq_dec j j0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
+  - destruct (sql_type_eq_dec s s0).
+    + subst. left. reflexivity.
+    + right. intro H. injection H. contradiction.
 Defined.
 
 Lemma typed_tuple_eq_dec : forall (t1 t2 : typed_tuple), {t1 = t2} + {t1 <> t2}.
@@ -2503,6 +2580,11 @@ Proof.
     destruct (IHe (tuple_schema tu) tu H2 Huniq eq_refl Hm Htotal) as [v Hv].
     rewrite Hv.
     destruct v.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
+    + exists (VBool false). reflexivity.
     + exists (VBool false). reflexivity.
     + exists (VBool false). reflexivity.
     + exists (VBool false). reflexivity.
@@ -3214,6 +3296,11 @@ Definition default_value_for_type (t : sql_type) : sql_value :=
   | TInt => VInt Z0
   | TString => VString EmptyString
   | TBool => VBool false
+  | TDate => VDate Z0
+  | TTime => VTime Z0
+  | TDecimal p s => VDecimal p s Z0
+  | TArray elem_t => VArray elem_t []
+  | TJson => VJson JNull
   end.
 
 Lemma default_value_type : forall t,
@@ -3453,3 +3540,97 @@ Fixpoint eval_query (cat : catalog) {s} (q : query_ast s) : option typed_bag :=
       | None => None
       end
   end.
+
+Lemma In_project_schema_In : forall cols s c t,
+  In (c, t) (project_schema cols s) ->
+  In c cols.
+Proof.
+  induction cols; intros; simpl in *.
+  - contradiction.
+  - destruct (find _ s) eqn:E.
+    + destruct p as [q0 s0]. destruct H.
+      * injection H; intros; subst.
+        apply find_some in E.
+        destruct E as [HIn HEq].
+        destruct (qualified_column_eqb_spec (fst (c, t)) a).
+        -- simpl in e. subst. auto.
+        -- discriminate.
+      * right. apply IHcols with s t. auto.
+    + right. apply IHcols with s t. auto.
+Qed.
+
+Lemma project_schema_NoDup : forall cols s,
+  unique_schema s ->
+  NoDup cols ->
+  NoDup (map fst (project_schema cols s)).
+Proof.
+  induction cols; intros; simpl.
+  - constructor.
+  - destruct (find _ s) eqn:E.
+    + destruct p as [q0 t0]. simpl.
+      constructor.
+      * intro.
+        apply in_map_iff in H1.
+        destruct H1 as [[c' t'] [H1 H2]].
+        simpl in H1. subst c'.
+        apply In_project_schema_In in H2.
+        apply find_some in E.
+        destruct E as [HIn HEq].
+        destruct (qualified_column_eqb_spec (fst (q0, t0)) a).
+        -- simpl in e. subst q0.
+           inversion H0. contradiction.
+        -- discriminate.
+      * apply IHcols; auto.
+        inversion H0; auto.
+    + apply IHcols; auto.
+      inversion H0; auto.
+Qed.
+
+Lemma NoDup_map_inj : forall {A B} (f : A -> B) l,
+  (forall x y, In x l -> In y l -> f x = f y -> x = y) ->
+  NoDup l ->
+  NoDup (map f l).
+Proof.
+  intros A B f l Hinj.
+  induction 1; simpl; constructor.
+  - intro. apply in_map_iff in H1.
+    destruct H1 as [y [Heq Hin]].
+    assert (x = y).
+    { apply Hinj.
+      - left. reflexivity.
+      - right. auto.
+      - rewrite Heq. reflexivity. }
+    subst. contradiction.
+  - apply IHNoDup.
+    intros x0 y0 Hx0 Hy0. apply Hinj; right; auto.
+Qed.
+
+Lemma unique_schema_NoDup : forall s,
+  NoDup (map fst s) ->
+  unique_schema s.
+Proof.
+  intros s H.
+  unfold unique_schema.
+  intros i j c t1 t2 Hneq Hi Hj.
+  assert (nth_error (map fst s) i = Some c).
+  { rewrite nth_error_map. rewrite Hi. reflexivity. }
+  assert (nth_error (map fst s) j = Some c).
+  { rewrite nth_error_map. rewrite Hj. reflexivity. }
+  rewrite NoDup_nth_error in H.
+  assert (i = j).
+  { apply (H i j).
+    - rewrite map_length. apply nth_error_Some. rewrite Hi. discriminate.
+    - congruence. }
+  contradiction.
+Qed.
+
+Lemma project_schema_unique : forall s cols,
+  unique_schema s ->
+  NoDup cols ->
+  unique_schema (project_schema cols s).
+Proof.
+  intros s cols Huniq Hnodup.
+  apply unique_schema_NoDup.
+  apply project_schema_NoDup; auto.
+Qed.
+             
